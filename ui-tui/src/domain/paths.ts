@@ -43,6 +43,18 @@ export const fmtProjectCwdBranch = (cwd: string, branch: null | string, projectN
   return `${project}${separator}${fmtCwdBranch(cwd, branch, remaining)}`
 }
 
+/** Default cap on the session-name segment of a composed title. */
+export const TITLE_MAX_NAME = 28
+
+/** Default cap on the cwd segment of a composed title. */
+export const TITLE_MAX_CWD = 24
+
+export const shortSessionName = (sessionName: string, max = TITLE_MAX_NAME): string => {
+  const name = sessionName.trim()
+
+  return name.length > max ? `${name.slice(0, max - 1)}…` : name
+}
+
 /**
  * Compose the terminal titlebar string:
  *   `<marker> <session name> · <model> · <cwd>`
@@ -57,12 +69,79 @@ export const composeTabTitle = (
   sessionName: string,
   model: string,
   cwd: string,
-  maxName = 28
+  maxName = TITLE_MAX_NAME
 ): string => {
-  const name = sessionName.trim()
-  const shortName = name.length > maxName ? `${name.slice(0, maxName - 1)}…` : name
+  const shortName = shortSessionName(sessionName, maxName)
 
   const segments = [shortName, model, cwd].filter(Boolean)
 
   return segments.length ? `${marker} ${segments.join(' · ')}` : marker
+}
+
+/** Values a title template can interpolate. `*_full` variants skip the
+ *  length caps and prefix-stripping that the short forms apply. */
+export interface TitleTokens {
+  cwd: string
+  cwdFull: string
+  marker: string
+  model: string
+  modelFull: string
+  session: string
+  sessionFull: string
+}
+
+// Recognized placeholders. Unknown `{tokens}` are left VERBATIM rather than
+// blanked: a typo stays visible in the title bar instead of silently
+// vanishing, which is the cheaper failure to diagnose.
+const TITLE_TOKEN_PATTERN = /\{(cwd|cwd_full|marker|model|model_full|session|session_full)\}/g
+
+/**
+ * Render a user-supplied title template (`display.tab_title_template` /
+ * `display.window_title_template`).
+ *
+ * Empty/blank template ⇒ `null`, meaning "caller keeps its built-in default".
+ *
+ * Segment separators are part of the template, so a token that resolves to an
+ * empty string would leave a dangling ` · `. We therefore collapse runs of
+ * separator/whitespace left by empty tokens, and trim them from both ends.
+ */
+export const renderTitleTemplate = (template: string, tokens: TitleTokens): null | string => {
+  if (!template.trim()) {
+    return null
+  }
+
+  const substituted = template.replace(TITLE_TOKEN_PATTERN, (_match, name: string) => {
+    switch (name) {
+      case 'cwd':
+        return tokens.cwd
+
+      case 'cwd_full':
+        return tokens.cwdFull
+
+      case 'marker':
+        return tokens.marker
+
+      case 'model':
+        return tokens.model
+
+      case 'model_full':
+        return tokens.modelFull
+
+      case 'session':
+        return tokens.session
+
+      case 'session_full':
+        return tokens.sessionFull
+
+      default:
+        return ''
+    }
+  })
+
+  // Collapse the separators orphaned by empty tokens (`a ·  · b` ⇒ `a · b`),
+  // then strip leading/trailing separators and whitespace.
+  return substituted
+    .replace(/\s*·(?:\s*·)+\s*/g, ' · ')
+    .replace(/^[\s·]+|[\s·]+$/g, '')
+    .replace(/\s{2,}/g, ' ')
 }
