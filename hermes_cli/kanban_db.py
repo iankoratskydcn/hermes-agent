@@ -3661,10 +3661,15 @@ def invalidate_descendants_for_parent_reopen(
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+    task_mode: Optional[str] = None, ears_sentence: Optional[str] = None,
 ) -> bool:
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
     gating still applies; the audit comment is written only when a field changed.
+
+    ``task_mode``/``ears_sentence``: Wave2/1a schema-foundation fields (Rule 2/6).
+    Unset (``None``) leaves the column untouched — callers that don't classify
+    a task keep existing/NULL behaviour.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
@@ -3691,6 +3696,12 @@ def specify_triage_task(
             sets.append("assignee = ?")
             params.append(assignee)
             changed_fields.append("assignee")
+        if task_mode is not None:
+            sets.append("task_mode = ?")
+            params.append(task_mode)
+        if ears_sentence is not None:
+            sets.append("ears_sentence = ?")
+            params.append(ears_sentence)
         params.append(task_id)
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
@@ -3876,14 +3887,16 @@ def _insert_decomposed_child(
     skills = _normalize_task_skills(root_skills)
     idempotency_key = f"decompose:{root_id}:{child_index}"
     body = child.get("body")
+    task_mode = child.get("task_mode")
+    ears_sentence = child.get("ears_sentence")
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, priority, workspace_kind, "
         " workspace_path, branch_name, project_id, tenant, idempotency_key, "
         " max_runtime_seconds, skills, max_retries, model_override, "
         " provider_override, reasoning_effort, goal_mode, goal_max_turns, "
-        " session_id, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " session_id, created_at, created_by, task_mode, ears_sentence) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
             _canonical_assignee(child.get("assignee")), root_row["priority"], child_ws_kind,
@@ -3894,6 +3907,8 @@ def _insert_decomposed_child(
             root_row["provider_override"], root_row["reasoning_effort"],
             root_row["goal_mode"], root_row["goal_max_turns"], root_row["session_id"],
             now, (author or "decomposer"),
+            task_mode if isinstance(task_mode, str) and task_mode else None,
+            ears_sentence if isinstance(ears_sentence, str) and ears_sentence else None,
         ),
     )
     _append_event(
