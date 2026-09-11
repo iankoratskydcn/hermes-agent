@@ -577,37 +577,130 @@ def write_board_metadata(
     "" = clear (``project_id`` is not validated here). ``dispatch_enabled`` /
     ``auto_decompose_enabled`` / ``review_dispatch_enabled``: ``None`` = unchanged
     (tri-state like ``archived``, not the string-clearing convention above).
+
+    The read-modify-write cycle is guarded by a bounded, best-effort
+    cross-process advisory lock on a sibling ``.board.json.lock`` file so two
+    concurrent writers (e.g. the desktop UI and a CLI/dashboard caller toggling
+    different fields at once) cannot silently drop one write. The lock itself
+    is advisory and best-effort (like the rest of Kanban's cross-process
+    locking, see ``kanban_db_connect._try_lock_nb``): an unavailable/hung lock
+    still lets the write proceed rather than blocking a caller forever.
     """
     _assert_not_delegated_child_mutation()
     slug = _slug_or_default(board)
-    meta = read_board_metadata(slug)
-    # db_path is derived on every read; never persist it into board.json.
-    meta.pop("db_path", None)
-    if name is not None:
-        meta["name"] = str(name).strip() or _default_board_display_name(slug)
-    for key, value in (("description", description), ("icon", icon), ("color", color)):
-        if value is not None:
-            meta[key] = str(value)
-    if archived is not None:
-        meta["archived"] = bool(archived)
-    if dispatch_enabled is not None:
-        meta["dispatch_enabled"] = bool(dispatch_enabled)
-    if auto_decompose_enabled is not None:
-        meta["auto_decompose_enabled"] = bool(auto_decompose_enabled)
-    if review_dispatch_enabled is not None:
-        meta["review_dispatch_enabled"] = bool(review_dispatch_enabled)
-    for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
-        if value is not None:
-            meta[key] = str(value) if value else None
-    if not meta.get("created_at"):
-        meta["created_at"] = int(time.time())
-    path = board_metadata_path(slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
-    )
+    lock_path = board_metadata_path(slug).with_name("." + board_metadata_path(slug).name + ".lock")
+    with _board_metadata_write_lock(lock_path):
+        meta = read_board_metadata(slug)
+        # db_path is derived on every read; never persist it into board.json.
+        meta.pop("db_path", None)
+        if name is not None:
+            meta["name"] = str(name).strip() or _default_board_display_name(slug)
+        for key, value in (("description", description), ("icon", icon), ("color", color)):
+            if value is not None:
+                meta[key] = str(value)
+        if archived is not None:
+            meta["archived"] = bool(archived)
+        if dispatch_enabled is not None:
+            meta["dispatch_enabled"] = bool(dispatch_enabled)
+        if auto_decompose_enabled is not None:
+            meta["auto_decompose_enabled"] = bool(auto_decompose_enabled)
+        if review_dispatch_enabled is not None:
+            meta["review_dispatch_enabled"] = bool(review_dispatch_enabled)
+        for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
+            if value is not None:
+                meta[key] = str(value) if value else None
+        if not meta.get("created_at"):
+            meta["created_at"] = int(time.time())
+        path = board_metadata_path(slug)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_board_metadata(path, meta)
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
+
+
+@contextlib.contextmanager
+def _board_metadata_write_lock(lock_path: Path):
+    """Bounded, best-effort cross-process advisory lock for the board.json
+    read-modify-write cycle (same shape/timeout as
+    ``kanban_db_connect._cross_process_init_lock``, duplicated here rather
+    than imported to avoid a module-load cycle: ``kanban_db_connect`` binds
+    ``_kb = hermes_cli.kanban_db`` at import time). Poll non-blocking until
+    the deadline, then proceed WITHOUT the lock rather than hang a caller —
+    losing this race means one writer's change is briefly overwritten by a
+    concurrent one's stale read, not corruption (the file itself is always
+    written atomically by :func:`_atomic_write_board_metadata`).
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + 5.0
+    handle = None
+    acquired = False
+    try:
+        handle = open(lock_path, "a+b")
+        while time.monotonic() < deadline:
+            try:
+                if _kb_try_lock_nb(handle):
+                    acquired = True
+                    break
+            except OSError:
+                break
+            time.sleep(0.02)
+        yield
+    finally:
+        if handle is not None:
+            if acquired:
+                with contextlib.suppress(OSError):
+                    _kb_unlock(handle)
+            with contextlib.suppress(OSError):
+                handle.close()
+
+
+def _kb_try_lock_nb(handle) -> bool:
+    """One non-blocking exclusive lock attempt on ``handle``."""
+    if _IS_WINDOWS:
+        import msvcrt
+        handle.seek(0)
+        try:
+            getattr(msvcrt, "locking")(handle.fileno(), getattr(msvcrt, "LK_NBLCK"), 1)
+        except OSError:
+            return False
+    else:
+        import fcntl
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+    return True
+
+
+def _kb_unlock(handle) -> None:
+    if _IS_WINDOWS:
+        import msvcrt
+        handle.seek(0)
+        getattr(msvcrt, "locking")(handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
+    else:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _atomic_write_board_metadata(path: Path, meta: dict) -> None:
+    """Crash-safe replace: write to a sibling temp file, fsync it, then
+    ``os.replace`` onto ``path`` (atomic on POSIX and Windows). A process
+    killed mid-write leaves either the old ``board.json`` intact or the new
+    one fully written — never truncated/partial JSON that
+    :func:`read_board_metadata` would silently treat as malformed and
+    replace with all-defaults (which re-enables dispatch/decompose/review).
+    """
+    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    payload = json.dumps(meta, indent=2, ensure_ascii=False) + "\n"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink()
 
 
 def create_board(

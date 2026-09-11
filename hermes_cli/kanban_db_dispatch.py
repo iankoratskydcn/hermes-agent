@@ -129,6 +129,19 @@ class DispatchResult:
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
+    admission_blocked: Optional[str] = None
+    """Set (non-None) when :func:`dispatch_once` refused to claim/spawn this
+    tick because the global emergency stop is engaged (``"estop"``) or this
+    board's ``dispatch_enabled`` metadata flag is false
+    (``"board_dispatch_disabled"``). This is the SAME admission check the
+    embedded gateway watcher performs before calling ``dispatch_once`` at all
+    (``gateway/kanban_watchers_common.py::_kanban_dispatch_allowed`` and
+    ``gateway/kanban_watchers_dispatcher.py``'s per-board ``dispatch_enabled``
+    read) — re-applied HERE so every direct caller (dashboard ``POST
+    /dispatch``, ``hermes kanban dispatch``, the standalone daemon) is gated
+    identically and cannot bypass an operator's pause/toggle by calling
+    ``dispatch_once`` directly. ``dry_run=True`` is exempt (a preview claims
+    and spawns nothing, so it is safe to run while paused/disabled)."""
     memory_pressure: Optional[str] = None
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
@@ -1428,6 +1441,35 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _dispatch_admission_blocked_reason(board: Optional[str]) -> Optional[str]:
+    """Fail-closed Rule-1 admission check shared by every dispatch_once caller.
+
+    Returns ``"estop"`` if the global emergency stop is engaged, or
+    ``"board_dispatch_disabled"`` if this board's ``dispatch_enabled``
+    metadata flag is explicitly false. Returns ``None`` (admitted) only when
+    both checks are resolvable and pass. Any exception resolving either check
+    is treated as blocked (fail closed) — an unreadable/corrupt estop sentinel
+    or board.json must never silently permit dispatch.
+    """
+    try:
+        from gateway.kanban_watchers_common import _kanban_dispatch_allowed
+        if not _kanban_dispatch_allowed():
+            return "estop"
+    except ImportError:
+        # estop module unavailable in this deployment: fail open only for
+        # this specific ImportError case (matches _kanban_dispatch_allowed's
+        # own contract of failing open when agent.estop cannot be imported).
+        pass
+    except Exception:
+        return "estop"
+    try:
+        if not _kb.read_board_metadata(board).get("dispatch_enabled", True):
+            return "board_dispatch_disabled"
+    except Exception:
+        return "board_dispatch_disabled"
+    return None
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -1466,6 +1508,21 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
         )
+
+    # --- Rule-1/emergency-stop admission gate: applied ONCE here so every
+    # real entry point (embedded gateway watcher, dashboard `POST /dispatch`,
+    # `hermes kanban dispatch`, the standalone daemon) is gated identically —
+    # none of them may claim/spawn while the global ESTOP sentinel is engaged
+    # or this board's own `dispatch_enabled` metadata flag is false. Fails
+    # CLOSED: any error resolving either check refuses the tick rather than
+    # dispatching. `dry_run=True` bypasses this gate (a preview claims and
+    # spawns nothing). See DispatchResult.admission_blocked.
+    if not dry_run:
+        blocked_reason = _dispatch_admission_blocked_reason(board)
+        if blocked_reason is not None:
+            result = DispatchResult(admission_blocked=blocked_reason)
+            _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+            return result
 
     try:
         db_path = _kb.kanban_db_path(board=board)
