@@ -843,12 +843,22 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Wave2/1a schema-foundation fields (Rule 2/6 + atomic-task-gate precheck).
+    # Schema-only here: no dispatch/gate enforcement reads these yet.
+    task_mode: Optional[str] = None           # 'autocomplete' | 'chat' | 'agent'
+    ears_sentence: Optional[str] = None       # EARS-restated requirement (Rule 6)
+    oracle: Optional[str] = None              # named independent verification oracle
+    scope_paths: Optional[list] = None        # JSON-encoded list of allowed file paths
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         g = lambda col, default=None: _row_get(row, col, default)  # noqa: E731
         parsed = _json_or(g("skills"))
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
+        scope_parsed = _json_or(g("scope_paths"))
+        scope_paths_value = (
+            [str(p) for p in scope_parsed if p] if isinstance(scope_parsed, list) else None
+        )
         return cls(
             **{col: row[col] for col in _TASK_REQUIRED_COLUMNS},
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
@@ -860,6 +870,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            scope_paths=scope_paths_value,
         )
 
 
@@ -873,6 +884,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "task_mode", "ears_sentence", "oracle",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1069,7 +1081,18 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Wave2/1a schema-foundation columns. Schema-only: not yet consulted by
+    -- dispatch/gate enforcement (a separate downstream wave wires them in).
+    -- Rule 2 verification-rigor classification: 'autocomplete'|'chat'|'agent'.
+    task_mode            TEXT,
+    -- Rule 6 EARS-restated requirement for this task.
+    ears_sentence         TEXT,
+    -- Named independent verification oracle for this task.
+    oracle                TEXT,
+    -- JSON-encoded list of file paths this task may touch (atomic-task-gate
+    -- precheck input). NULL = unset; matches the ``skills`` None-vs-[] shape.
+    scope_paths           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1377,6 +1400,25 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def _normalize_scope_paths(scope_paths: Optional[Iterable[str]]) -> Optional[list[str]]:
+    """Strip/dedupe a scope_paths list (relative file paths the atomic-task-gate
+    precheck will validate a task against). Mirrors ``_normalize_task_skills``'s
+    None-vs-[] semantics: None = unset, [] = explicitly empty."""
+    if scope_paths is None:
+        return None
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for p in scope_paths:
+        if not p:
+            continue
+        path = str(p).strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        cleaned.append(path)
+    return cleaned
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1391,6 +1433,10 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    task_mode: Optional[str] = None,
+    ears_sentence: Optional[str] = None,
+    oracle: Optional[str] = None,
+    scope_paths: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1406,6 +1452,10 @@ def create_task(
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+    ``task_mode``/``ears_sentence``/``oracle``/``scope_paths``: Wave2/1a
+    schema-foundation fields (Rule 2/6 verification-rigor classification, EARS
+    restatement, named oracle, atomic-task-gate scope). Schema-only here — NULL
+    when unset; not consulted by dispatch/gate enforcement yet.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
@@ -1444,6 +1494,7 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    scope_paths_list = _normalize_scope_paths(scope_paths)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1490,8 +1541,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        task_mode, ears_sentence, oracle, scope_paths
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1501,6 +1553,8 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        task_mode, ears_sentence, oracle,
+                        json.dumps(scope_paths_list) if scope_paths_list is not None else None,
                     ),
                 )
                 for pid in parents:
