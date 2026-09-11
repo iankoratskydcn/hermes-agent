@@ -617,6 +617,15 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         # None (default, absent key) means "no gate configured" — existing
         # boards are completely unaffected until an operator opts in.
         "batch_approval_gate": None,
+        # Wave2/2c: deterministic atomic-task-gate/ears-sensibility-gate
+        # precheck at dispatch time (hermes_cli/kanban_gate_precheck.py).
+        # False (default, absent key) means "no precheck" — unlike the F1
+        # batch-approval gate above, this is opt-IN per board: a new,
+        # unproven heuristic with a materially different risk profile
+        # (false positives/negatives on the EARS-shape check), so existing
+        # and new boards alike stay unaffected until an operator explicitly
+        # turns it on.
+        "gate_precheck_enabled": False,
     }
     p = board_metadata_path(slug)
     file_exists = False
@@ -661,12 +670,14 @@ def write_board_metadata(
     default_workdir: Optional[str] = None, project_id: Optional[str] = None,
     dispatch_enabled: Optional[bool] = None, auto_decompose_enabled: Optional[bool] = None,
     review_dispatch_enabled: Optional[bool] = None, batch_approval_gate: Any = _UNSET,
+    gate_precheck_enabled: Optional[bool] = None,
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
     set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
     "" = clear (``project_id`` is not validated here). ``dispatch_enabled`` /
-    ``auto_decompose_enabled`` / ``review_dispatch_enabled``: ``None`` = unchanged
-    (tri-state like ``archived``, not the string-clearing convention above).
+    ``auto_decompose_enabled`` / ``review_dispatch_enabled`` / ``gate_precheck_enabled``:
+    ``None`` = unchanged (tri-state like ``archived``, not the string-clearing
+    convention above).
     ``batch_approval_gate`` (F1): the default sentinel (omitted) = unchanged;
     ``None`` explicitly clears the gate (dispatch proceeds ungated again);
     ``{"project": ..., "batch_id": ...}`` sets/replaces it. Uses its own
@@ -701,6 +712,8 @@ def write_board_metadata(
             meta["auto_decompose_enabled"] = bool(auto_decompose_enabled)
         if review_dispatch_enabled is not None:
             meta["review_dispatch_enabled"] = bool(review_dispatch_enabled)
+        if gate_precheck_enabled is not None:
+            meta["gate_precheck_enabled"] = bool(gate_precheck_enabled)
         if batch_approval_gate is not _UNSET:
             meta["batch_approval_gate"] = batch_approval_gate
         for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):

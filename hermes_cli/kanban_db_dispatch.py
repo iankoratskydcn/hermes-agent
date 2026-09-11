@@ -110,6 +110,11 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_gate_precheck: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` blocked by the Wave2/2c deterministic gate
+    precheck (``kanban_gate_precheck.gate_precheck``) when the board opts in
+    via ``kanban.gate_precheck_enabled``. Distinct from ``respawn_guarded``
+    (a different mechanism, always-on) so telemetry can tell them apart."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -1744,6 +1749,20 @@ def _dispatch_lane_task(
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
 
+    # Wave2/2c: deterministic gate precheck, opt-in per board via
+    # kanban.gate_precheck_enabled (default False — unlike F1's default-gated
+    # batch-approval check, this is a new, unproven heuristic with a
+    # materially different risk profile, so a board must explicitly turn it
+    # on). Distinct bucket (skipped_gate_precheck) from respawn_guarded so
+    # telemetry can tell the two mechanisms apart.
+    if bool(_kb.read_board_metadata(board).get("gate_precheck_enabled", False)):
+        task_for_precheck = _kb.get_task(conn, task_id)
+        if task_for_precheck is not None:
+            precheck = _gate_precheck.gate_precheck(task_for_precheck)
+            if precheck["status"] == _gate_precheck.STATUS_BLOCKED:
+                result.skipped_gate_precheck.append((task_id, precheck["reason"]))
+                return False
+
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
         # ticks re-query from the DB.
@@ -2554,3 +2573,4 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
+from hermes_cli import kanban_gate_precheck as _gate_precheck  # noqa: E402
