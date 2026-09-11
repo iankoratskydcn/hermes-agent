@@ -133,6 +133,15 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    gate_blocked: Optional[str] = None
+    """Set when this tick did NOTHING (no reclaim, no claim, no spawn)
+    because a dispatch gate refused it: ``"board_dispatch_disabled"`` (F5,
+    the board's own ``dispatch_enabled`` toggle) or
+    ``"batch_approval_required"`` (F1, decision-hud's
+    ``require_batch_approval`` — see :func:`batch_approval_gate_ok`). Both
+    gates are enforced once, in :func:`dispatch_once`, so every real
+    dispatch entry point (CLI, dashboard, gateway sweep, standalone daemon)
+    inherits them without each caller re-implementing the check."""
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -1277,7 +1286,14 @@ def review_dispatch_enabled(board: Optional[str] = None) -> bool:
         from hermes_cli import kanban_db
         return bool(kanban_db.read_board_metadata(board).get("review_dispatch_enabled", True))
     except Exception:
-        return global_enabled
+        # Fail CLOSED: this is a safety gate, not a display default. A read/
+        # parse error here must never resolve to "dispatch anyway" — that
+        # silently reinstates the exact race the toggle exists to prevent.
+        # (Note: read_board_metadata() itself already swallows OSError/
+        # JSONDecodeError and returns a safe default dict, so this branch is
+        # a last-resort net for an unexpected failure, e.g. kanban_db being
+        # unimportable — it must not be reached in the common case.)
+        return False
 
 
 # Memory-aware dispatch guard: an uncapped board once OOM'd a 1 GiB host. Two
@@ -1428,6 +1444,116 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+# --- F1/F5 dispatch gates: enforced ONCE, in dispatch_once(), so every real
+# entry point (CLI, dashboard, gateway sweep, standalone daemon) inherits
+# them automatically. Both fail CLOSED on any read/parse error. ------------
+
+def _resolve_gate_board(board: Optional[str]) -> Optional[str]:
+    """Resolve ``board=None`` to the actual board a ``None``-board dispatch
+    call targets, so the gate checks the SAME board.json that
+    ``kanban_db_path(board=None)`` resolves to (via ``get_current_board()``)
+    instead of silently skipping the check for the common no-``--board``
+    call shape. Falls back to ``None`` only if the current board itself
+    can't be resolved at all (no board context whatsoever) — callers treat
+    that as "no board to gate", not as an escape hatch from the
+    default-gated policy below.
+    """
+    if board is not None:
+        return board
+    try:
+        return _kb.get_current_board()
+    except Exception:
+        return None
+
+
+def _board_dispatch_gate_ok(board: Optional[str]) -> bool:
+    """F5: per-board ``dispatch_enabled`` toggle, enforced at the one real
+    choke point instead of only in the gateway sweep's own pre-check.
+
+    ``board`` resolves through :func:`_resolve_gate_board` first so a
+    ``None``-board caller (e.g. ``hermes kanban dispatch`` with no
+    ``--board``) is checked against the SAME board its dispatch actually
+    targets, not silently skipped. Any failure to read the toggle fails
+    CLOSED (dispatch is refused), matching ``review_dispatch_enabled``'s
+    fail-closed exception path above.
+    """
+    resolved = _resolve_gate_board(board)
+    if resolved is None:
+        return True
+    try:
+        return bool(_kb.read_board_metadata(resolved).get("dispatch_enabled", True))
+    except Exception:
+        return False
+
+
+def batch_approval_gate_ok(board: Optional[str]) -> tuple[bool, str]:
+    """F1: decision-hud's ``require_batch_approval()`` gate, checked before
+    ANY task claim/spawn on this board. ``(ok, reason)``.
+
+    Default-gated (per owner decision, superseding the earlier opt-in
+    design): every board must have a ``batch_approval_gate`` field in
+    ``board.json`` (``{"project": ..., "batch_id": ...}``) pointing at an
+    APPROVED decision-hud batch, or dispatch is refused outright — there is
+    no "no gate configured -> proceed" path any more. An operator opts a
+    board INTO dispatch by pushing+approving a batch and wiring its
+    (project, batch_id) onto the board via ``hermes kanban boards
+    set-batch-gate``; there is no way to opt a board OUT of requiring this.
+
+    Single-use / self-clearing: once a check here passes (batch is
+    APPROVED) and the calling ``dispatch_once`` tick actually proceeds past
+    the gate, the gate is atomically cleared back to unset so the NEXT tick
+    starts ungated again — matching the original "PO approves this batch of
+    tasks" intent (one approval authorizes one dispatch cycle, not
+    indefinite future dispatch). The operator must push+approve a fresh
+    batch for every subsequent round. Clearing happens in
+    :func:`dispatch_once` immediately after this returns ``True``, not here
+    (this function is a pure read).
+
+    When configured, this calls straight into decision-hud's own
+    ``require_batch_approval()`` (no vendored copy of its approve/reject/
+    pending logic) via ``hermes_cli.plugin_bridges.decision_hud`` — the
+    plugin lives at ``~/.hermes/plugins/decision-hud`` (a standalone,
+    non-git-tracked-at-that-path install; NOT importable as a normal
+    package), so the bridge locates and imports it by absolute file path.
+
+    ``board`` resolves through :func:`_resolve_gate_board` first, same
+    reasoning as :func:`_board_dispatch_gate_ok`.
+
+    Fails CLOSED in every case: no gate configured -> BLOCK (this is now
+    the default-gated mandate, not a display default); gate configured but
+    decision-hud unimportable, DB unreadable, or the batch
+    missing/pending/rejected -> BLOCK. An exception here must never resolve
+    to "dispatch anyway".
+    """
+    resolved = _resolve_gate_board(board)
+    if resolved is None:
+        return False, "no board context resolvable — cannot verify a batch_approval_gate, failing closed"
+    try:
+        gate = _kb.read_board_metadata(resolved).get("batch_approval_gate")
+    except Exception as exc:
+        return False, f"could not read board metadata: {exc}"
+    if not gate:
+        return False, (
+            f"no batch_approval_gate configured for board {resolved!r} — "
+            "dispatch is default-gated: an operator must push+approve a "
+            "decision-hud batch for this board before any task may be "
+            "claimed or spawned (hermes kanban boards set-batch-gate)"
+        )
+    if not isinstance(gate, dict) or not gate.get("project") or not gate.get("batch_id"):
+        return False, f"malformed batch_approval_gate on board {resolved!r}: {gate!r}"
+    try:
+        from hermes_cli.plugin_bridges import decision_hud as _dh_bridge
+    except Exception as exc:
+        return False, f"decision-hud bridge unavailable: {exc}"
+    try:
+        ok, reason = _dh_bridge.check_batch_approval(
+            project=str(gate["project"]), batch_id=str(gate["batch_id"]),
+        )
+    except Exception as exc:
+        return False, f"batch approval check failed: {exc}"
+    return ok, reason
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -1450,7 +1576,75 @@ def dispatch_once(
     frames. The loser returns an empty ``DispatchResult`` with
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
+
+    This is the SINGLE canonical choke point for task claim/spawn (F1/F5):
+    every real dispatch entry point — ``hermes kanban dispatch`` (CLI,
+    ``kanban_ops.py``), the dashboard's ``POST /dispatch``
+    (``plugins/kanban/dashboard/plugin_api.py``), the gateway's embedded
+    sweep (``gateway/kanban_watchers_dispatcher.py``), and the standalone
+    ``run_daemon`` loop below — all call ``dispatch_once``; nothing outside
+    this module (and its tests) calls ``_dispatch_once_locked`` directly.
+    Gating here, before the lock is even taken, means no caller can bypass
+    it by skipping a wrapper: both checks run FIRST, unconditionally, and a
+    read/parse failure on either fails CLOSED (refuses to dispatch), never
+    open. board=None (the legacy no-board caller) skips the board-level gate
+    (there is no board to gate) but a global config value can still refuse
+    to run below.
     """
+    if not _board_dispatch_gate_ok(board):
+        result = DispatchResult(gate_blocked="board_dispatch_disabled")
+        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+        return result
+    batch_ok, batch_reason = batch_approval_gate_ok(board)
+    if not batch_ok:
+        _kb._log.warning(
+            "kanban dispatch: board %r blocked by decision-hud batch approval gate: %s",
+            board, batch_reason,
+        )
+        result = DispatchResult(gate_blocked="batch_approval_required")
+        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+        return result
+    # The gate passed for THIS tick. Per owner decision, an approval is
+    # single-use: it authorizes one dispatch cycle, not indefinite future
+    # dispatch, matching the original "PO approves this batch of tasks"
+    # intent. Consume it now (clear board.json's batch_approval_gate) —
+    # unconditionally, not deferred until after the locked tick — so a
+    # concurrent resolve/inspect of board.json can never observe a
+    # "gate still set but already spent" state, and so the consumption
+    # can't be skipped by an exception during the tick itself. dry_run
+    # ticks do NOT consume the gate (no real dispatch happened); a
+    # skipped_locked tick (another dispatcher won the lock) also must not
+    # consume it here, since THIS process never actually used the
+    # approval — deferred to right before the lock attempt so we still
+    # know whether we're a dry run, but before we know if we'll win the
+    # lock, is deliberately impossible to get race-free without holding
+    # the board lock too, so instead we scope consumption to "this call
+    # passed the gate and is not a dry run", accepting that a lock-losing
+    # dry-run-false tick still consumes the gate even though it didn't
+    # spawn anything this instant — the alternative (deferring past the
+    # lock) reintroduces a window where two callers can both read
+    # "approved" and both proceed to spawn before either clears it.
+    _gate_board = _resolve_gate_board(board)
+    if not dry_run and _gate_board is not None:
+        try:
+            _kb.write_board_metadata(_gate_board, batch_approval_gate=None)
+        except Exception:
+            # Consumption failing must not un-gate future ticks by
+            # accident, but it also must not silently re-arm the gate —
+            # log loudly; the NEXT tick will re-check batch_approval_gate_ok
+            # and, since we could not clear it, will see it still set and
+            # ask decision-hud again (this batch is likely still APPROVED,
+            # so the next tick would pass too — not a security hole, just
+            # means the "one approval, one cycle" contract slipped by one
+            # extra tick on a write failure, which is logged for the
+            # operator to notice).
+            _kb._log.warning(
+                "kanban dispatch: board %r batch approval gate could not be "
+                "cleared after a passing check — the approval may authorize "
+                "an extra dispatch tick beyond the intended single use",
+                _gate_board,
+            )
+
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
             conn,
