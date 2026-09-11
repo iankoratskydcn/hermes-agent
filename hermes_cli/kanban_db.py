@@ -627,7 +627,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
     if file_exists:
         try:
             raw = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             # File exists but could not be parsed — corruption (e.g. a torn
             # write), not "no board.json yet". Fail closed on the
             # safety-relevant toggles rather than silently re-enabling
