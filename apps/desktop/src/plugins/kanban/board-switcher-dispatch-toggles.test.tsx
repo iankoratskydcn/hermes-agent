@@ -102,7 +102,7 @@ describe('per-board dispatch toggles', () => {
     await openBoardSettings()
 
     const dispatchSwitch = await screen.findByRole('switch', { name: en.boardDispatchEnabled })
-    dispatchSwitch.click()
+    fireEvent.click(dispatchSwitch)
 
     await waitFor(() => expect(patched).toContainEqual({ slug: 'proj', patch: { dispatch_enabled: false } }))
     // The other two flags are untouched by this write.
