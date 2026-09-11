@@ -50,6 +50,13 @@ def fresh_home(tmp_path, monkeypatch):
     except Exception:
         pass
     kb._INITIALIZED_PATHS.clear()
+    # F1 (default-gated dispatch, landed after this file was authored): every
+    # board now requires an APPROVED decision-hud batch_approval_gate before
+    # dispatch_once() will claim/spawn anything at all. This suite tests the
+    # dispatch_enabled/auto_decompose_enabled toggles specifically, not F1's
+    # approval semantics — bypass the gate so those toggles are the only
+    # thing under test, matching the pre-F1 behavior this file assumes.
+    monkeypatch.setattr(kbd, "batch_approval_gate_ok", lambda board=None: (True, "test-bypass"))
     return home
 
 
