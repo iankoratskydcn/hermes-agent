@@ -358,7 +358,6 @@ _SPECS = [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
         _bulk_ids("promote"),
-        _arg("--force", action="store_true", help="Promote even if parent dependencies are not yet done/archived"),
         _arg("--readiness", action="store_true",
              help="Explicitly move a triage task to ready for a bounded readiness canary; requires an audit reason"),
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
