@@ -152,3 +152,33 @@ def check_batch_approval(*, project: str, batch_id: str) -> tuple[bool, str]:
                 conn.close()
             except Exception:
                 pass
+
+
+def push_problem_report(
+    *, project: str, problem: str, context: Optional[str] = None, reporter: Optional[str] = None,
+) -> tuple[bool, str]:
+    """File a raw problem report in decision-hud (Rule 6 EARS-gate refusal
+    path). ``(True, report_id)`` on success, ``(False, reason)`` on any
+    failure — mirrors :func:`check_batch_approval`'s never-raises contract
+    so a decision-hud outage never crashes the caller (the decomposer
+    proceeds with ``ears_sentence=None`` regardless; see
+    ``kanban_decompose.py``'s EARS-gate docstring for the fail-open
+    rationale).
+    """
+    try:
+        db = _load_decision_hud_db()
+    except Exception as exc:
+        return False, f"decision-hud unavailable: {exc}"
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = db.connect()
+        row = db.push_problem_report(conn, project=project, problem=problem, context=context, reporter=reporter)
+        return True, str(row.get("id", ""))
+    except Exception as exc:
+        return False, f"problem report push failed: {exc}"
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
