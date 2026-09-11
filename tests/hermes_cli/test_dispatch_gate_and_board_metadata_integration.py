@@ -218,19 +218,77 @@ class TestF1BatchApprovalGate:
         assert spawned_ids == [task_id], "an approved gate must let the ready task actually spawn"
         assert after.status == "running", "task must have transitioned once the gate passed"
 
-    def test_no_gate_configured_is_unaffected(self, fresh_home):
-        """Regression guard: a board with no batch_approval_gate at all must
-        dispatch exactly as before this feature existed."""
+    def test_approved_batch_gate_is_single_use_and_consumed_after_passing(self, fresh_home):
+        """Owner decision (post-review): an approval authorizes exactly ONE
+        dispatch cycle, matching the original 'PO approves this batch of
+        tasks' intent — it must not silently keep authorizing future ticks.
+        After a tick passes the gate, board.json's batch_approval_gate must
+        be cleared; the very next tick (same still-APPROVED batch, no new
+        gate set) must be blocked again."""
+        project, batch_id, task_id = self._setup_board_with_gate()
+        _push_batch(project, batch_id)
+        _resolve_batch(project, batch_id, "approve")
+
+        with kbc.connect(board="proj") as conn:
+            first = kbd.dispatch_once(conn, board="proj", spawn_fn=_no_spawn)
+        assert first.gate_blocked is None, "first tick must pass the approved gate"
+
+        meta_after_first = kb.read_board_metadata("proj")
+        assert meta_after_first.get("batch_approval_gate") is None, (
+            "a passing gate check must consume (clear) batch_approval_gate "
+            f"— found {meta_after_first.get('batch_approval_gate')!r} still set"
+        )
+
+        with kbc.connect(board="proj") as conn:
+            task_id_2 = kb.create_task(conn, title="more work", assignee="default", board="proj")
+            second = kbd.dispatch_once(conn, board="proj", spawn_fn=_no_spawn)
+            after_second = kb.get_task(conn, task_id_2)
+
+        assert second.gate_blocked == "batch_approval_required", (
+            "the SAME still-approved batch must not authorize a second tick "
+            "once its gate has been consumed — the operator must set a new one"
+        )
+        assert after_second.status == "ready", "no task may claim/spawn on the un-gated second tick"
+
+    def test_dry_run_tick_does_not_consume_the_gate(self, fresh_home):
+        """A dry_run tick that passes the gate check must NOT consume it —
+        no real dispatch happened, so the approval is still available for
+        the next real tick."""
+        project, batch_id, task_id = self._setup_board_with_gate()
+        _push_batch(project, batch_id)
+        _resolve_batch(project, batch_id, "approve")
+
+        with kbc.connect(board="proj") as conn:
+            dry = kbd.dispatch_once(conn, board="proj", spawn_fn=_no_spawn, dry_run=True)
+        assert dry.gate_blocked is None, "dry_run must still see the gate as passing"
+
+        meta_after_dry = kb.read_board_metadata("proj")
+        assert meta_after_dry.get("batch_approval_gate") == {"project": project, "batch_id": batch_id}, (
+            "a dry_run tick must NOT consume the gate — it did not really dispatch anything"
+        )
+
+        with kbc.connect(board="proj") as conn:
+            real = kbd.dispatch_once(conn, board="proj", spawn_fn=_no_spawn)
+        assert real.gate_blocked is None, "the real tick right after a dry_run must still pass"
+
+    def test_no_gate_configured_now_blocks_dispatch_default_gated(self, fresh_home):
+        """Policy change (owner decision, post-review): approval gate is now
+        DEFAULT-GATED, not opt-in. A board with no batch_approval_gate at
+        all must now be BLOCKED, not pass through — this replaces the old
+        opt-in assumption this test used to encode."""
         kb.create_board("proj")
         with kbc.connect(board="proj") as conn:
             task_id = kb.create_task(conn, title="do work", assignee="default", board="proj")
+            before = kb.get_task(conn, task_id)
             spawned = []
             result = kbd.dispatch_once(
                 conn, board="proj",
                 spawn_fn=lambda task, ws, board=None: spawned.append(task.id) or 1,
             )
-        assert result.gate_blocked is None
-        assert spawned == [task_id]
+            after = kb.get_task(conn, task_id)
+        assert result.gate_blocked == "batch_approval_required"
+        assert spawned == []
+        assert after.status == before.status
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +310,17 @@ class TestF5DispatchEnabledGate:
         assert after.status == before.status == "ready"
 
     def test_dispatch_enabled_true_allows_normal_dispatch(self, fresh_home):
+        """Note: since the owner's post-review change made F1's batch
+        approval gate default-gated (not opt-in), a board also needs an
+        APPROVED batch_approval_gate to actually dispatch now — dispatch_enabled
+        alone is necessary but no longer sufficient. Wire + approve a batch
+        here so this test still isolates the F5 toggle specifically."""
         kb.create_board("proj")
+        kb.write_board_metadata(
+            "proj", batch_approval_gate={"project": "proj-f5", "batch_id": "batch-f5"},
+        )
+        _push_batch("proj-f5", "batch-f5")
+        _resolve_batch("proj-f5", "batch-f5", "approve")
         with kbc.connect(board="proj") as conn:
             task_id = kb.create_task(conn, title="t", assignee="default", board="proj")
             spawned = []

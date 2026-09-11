@@ -125,6 +125,20 @@ _BOARD_SPECS = [
         _SLUG,
         _arg("state", choices=("on", "off"), help="Enable or disable review-lane dispatch for this board"),
     ], help="Toggle this board's override of the global kanban review-dispatch"),
+    _cmd("set-batch-gate", [
+        _SLUG,
+        _arg("project", nargs="?", help="decision-hud project name for the batch_approval card. Omit (with no --clear) to inspect current state."),
+        _arg("batch_id", nargs="?", help="decision-hud batch_id for the batch_approval card"),
+        _arg("--clear", action="store_true", help="Remove this board's batch_approval_gate instead of setting one"),
+        _json_flag(),
+    ], help="Point this board's dispatch gate at a decision-hud batch (F1: default-gated dispatch)", description=(
+        "Every board's dispatch is default-gated: dispatch_once() refuses to claim or spawn any "
+        "task until board.json's batch_approval_gate names an APPROVED decision-hud batch "
+        "(project, batch_id). Push and approve a batch first (hermes decision push-batch / "
+        "the Decision HUD desktop pane), then wire it here. The gate is single-use — a passing "
+        "check consumes it (clears batch_approval_gate back to unset) after one dispatch cycle, "
+        "so this command must be run again before the next round of work."
+    )),
     _cmd("export", [
         _arg("slug", nargs="?", help="Board to export (default: the current board)"),
         _arg("-o", "--output", help="Archive path (default: ./<slug>.tar.gz)"),
