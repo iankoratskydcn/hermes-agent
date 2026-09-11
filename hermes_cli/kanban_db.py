@@ -549,6 +549,12 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "dispatch_enabled": True,
         "auto_decompose_enabled": True,
         "review_dispatch_enabled": True,
+        # Decision HUD dispatch gate (F1, opt-in): a batch_id that must be
+        # resolved 'approve' via decision-hud's require_batch_approval()
+        # before this board's dispatch_once tick may claim/spawn any task.
+        # None (default, absent key) means "no gate configured" — existing
+        # boards are completely unaffected until an operator opts in.
+        "batch_approval_gate": None,
     }
     try:
         p = board_metadata_path(slug)
@@ -565,18 +571,26 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
     return meta
 
 
+_UNSET = object()
+
+
 def write_board_metadata(
     board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
     icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
     default_workdir: Optional[str] = None, project_id: Optional[str] = None,
     dispatch_enabled: Optional[bool] = None, auto_decompose_enabled: Optional[bool] = None,
-    review_dispatch_enabled: Optional[bool] = None,
+    review_dispatch_enabled: Optional[bool] = None, batch_approval_gate: Any = _UNSET,
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
     set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
     "" = clear (``project_id`` is not validated here). ``dispatch_enabled`` /
     ``auto_decompose_enabled`` / ``review_dispatch_enabled``: ``None`` = unchanged
     (tri-state like ``archived``, not the string-clearing convention above).
+    ``batch_approval_gate`` (F1): the default sentinel (omitted) = unchanged;
+    ``None`` explicitly clears the gate (dispatch proceeds ungated again);
+    ``{"project": ..., "batch_id": ...}`` sets/replaces it. Uses its own
+    sentinel (not ``None``) because ``None`` is itself a valid, meaningful
+    value here (clear the gate) — unlike the tri-state booleans above.
     """
     _assert_not_delegated_child_mutation()
     slug = _slug_or_default(board)
@@ -596,6 +610,8 @@ def write_board_metadata(
         meta["auto_decompose_enabled"] = bool(auto_decompose_enabled)
     if review_dispatch_enabled is not None:
         meta["review_dispatch_enabled"] = bool(review_dispatch_enabled)
+    if batch_approval_gate is not _UNSET:
+        meta["batch_approval_gate"] = batch_approval_gate
     for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
         if value is not None:
             meta[key] = str(value) if value else None

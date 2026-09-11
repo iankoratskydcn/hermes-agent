@@ -90,6 +90,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            # Threaded through so this call site gets the same board-level
+            # gates (F1 batch approval, F5 dispatch_enabled) the gateway
+            # sweep already applies — previously the CLI path called
+            # dispatch_once with no board at all, silently bypassing both.
+            board=kb.get_current_board(),
         )
     if getattr(args, "json", False):
         _print_json({
