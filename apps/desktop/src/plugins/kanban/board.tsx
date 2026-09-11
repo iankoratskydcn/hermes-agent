@@ -82,7 +82,7 @@ import { BoardSwitcher } from './board-switcher'
 import { TaskDrawer } from './drawer'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
-import { columnMeta, type BoardsResponse, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
+import { columnMeta, type BoardMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
 import {
   $newTaskLane,
   ago,
@@ -1094,26 +1094,55 @@ export function KanbanBoardPage() {
     refetchInterval: 60_000
   })
 
-  // Fetch board metadata for the toggle switches
+  // Fetch board metadata for the toggle switches. `slug` is the persisted
+  // local override; an empty slug means "the server's current board"
+  // (see api.ts's boardKey()/updateBoard() docs) — so board.current, not a
+  // literal empty-string match, is the effective identity for both display
+  // and the mutation target. Without this fallback the default/current
+  // board's Dispatch/Decompose/Review switches never render (currentBoard
+  // stays undefined) and, if ever reached another way, `updateBoard('', …)`
+  // would PATCH /boards/ instead of the real board.
   const { data: boards } = useQuery({ queryKey: BOARDS_KEY, queryFn: fetchBoards, staleTime: 30_000 })
-  const currentBoard = boards?.boards?.find(b => b.slug === slug)
+  const effectiveSlug = slug || boards?.current || ''
+  const currentBoard = boards?.boards?.find(b => b.slug === effectiveSlug)
 
-  // Toggle mutation for per-board settings
+  // Toggle mutation for per-board settings. Reconciles from the server's
+  // response payload (the authoritative post-write state), never the
+  // locally-sent patch — a slow/stale response must not stomp a newer toggle
+  // with older intent. Cache update is immutable (setQueryData, not
+  // Object.assign on the cached object) so React Query's own change
+  // detection and any concurrent reader see a consistent snapshot.
+  const [pendingToggle, setPendingToggle] = useState<null | string>(null)
   const toggleBoardSetting = useMutation({
-    mutationFn: (patch: Record<string, unknown>) => updateBoard(slug, patch),
+    mutationFn: (patch: Record<string, unknown>) => updateBoard(effectiveSlug, patch),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
-    onSuccess: (_, patch) => {
-      // Optimistically update via an immutable cache write (never mutate the
-      // cached board object in place) so react-query's reference-identity
-      // and reconciliation stay correct.
-      qc.setQueryData<BoardsResponse>(BOARDS_KEY, prev =>
-        prev
-          ? { ...prev, boards: prev.boards.map(b => (b.slug === slug ? { ...b, ...patch } : b)) }
-          : prev
-      )
-      void qc.invalidateQueries({ queryKey: BOARDS_KEY })
-    }
+    onSuccess: (response: { board: BoardMeta } | undefined) => {
+      const updated = response?.board
+      if (!updated) {
+        void qc.invalidateQueries({ queryKey: BOARDS_KEY })
+        return
+      }
+      qc.setQueryData(BOARDS_KEY, (prev: typeof boards) => {
+        if (!prev) {
+          return prev
+        }
+        return {
+          ...prev,
+          boards: prev.boards.map(b => (b.slug === updated.slug ? { ...b, ...updated } : b))
+        }
+      })
+    },
+    onSettled: () => setPendingToggle(null)
   })
+  const setBoardToggle = (field: string, enabled: boolean) => {
+    // Serialize: ignore a second click on the same field while a write for
+    // it is still in flight, instead of racing two overlapping PATCHes.
+    if (pendingToggle === field) {
+      return
+    }
+    setPendingToggle(field)
+    toggleBoardSetting.mutate({ [field]: enabled })
+  }
 
   const [openId, setOpenId] = useState<null | string>(null)
   const [addStatus, setAddStatus] = useState<null | string>(null)
@@ -1374,7 +1403,8 @@ export function KanbanBoardPage() {
                   <Switch
                     aria-label={k.boardDispatchEnabled}
                     checked={currentBoard.dispatch_enabled ?? true}
-                    onCheckedChange={enabled => toggleBoardSetting.mutate({ dispatch_enabled: enabled })}
+                    disabled={pendingToggle === 'dispatch_enabled'}
+                    onCheckedChange={enabled => setBoardToggle('dispatch_enabled', enabled)}
                   />
                   <span>Dispatch</span>
                 </label>
@@ -1384,7 +1414,8 @@ export function KanbanBoardPage() {
                   <Switch
                     aria-label={k.boardAutoDecomposeEnabled}
                     checked={currentBoard.auto_decompose_enabled ?? true}
-                    onCheckedChange={enabled => toggleBoardSetting.mutate({ auto_decompose_enabled: enabled })}
+                    disabled={pendingToggle === 'auto_decompose_enabled'}
+                    onCheckedChange={enabled => setBoardToggle('auto_decompose_enabled', enabled)}
                   />
                   <span>Decompose</span>
                 </label>
@@ -1394,7 +1425,8 @@ export function KanbanBoardPage() {
                   <Switch
                     aria-label={k.boardReviewDispatchEnabled}
                     checked={currentBoard.review_dispatch_enabled ?? true}
-                    onCheckedChange={enabled => toggleBoardSetting.mutate({ review_dispatch_enabled: enabled })}
+                    disabled={pendingToggle === 'review_dispatch_enabled'}
+                    onCheckedChange={enabled => setBoardToggle('review_dispatch_enabled', enabled)}
                   />
                   <span>Review</span>
                 </label>
