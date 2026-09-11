@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from toolsets import get_toolset_names
+from utils import atomic_write_text
 
 _log = logging.getLogger(__name__)
 
@@ -521,14 +522,75 @@ def board_metadata_path(board: Optional[str] = None) -> Path:
     return board_dir(_slug_or_default(board)) / "board.json"
 
 
+@contextlib.contextmanager
+def _board_metadata_lock(board_json_path: Path):
+    """Cross-process exclusive lock around a board.json read-modify-write cycle.
+
+    A sibling ``.board.json.lock`` file, ``fcntl.flock``-guarded — same shape
+    as ``kanban_db_connect._cross_process_init_lock``. Blocking (not
+    non-blocking/bounded like the init lock): a board.json write is a small,
+    fast, bounded critical section (no network/DB I/O), so a brief wait for a
+    concurrent writer is the correct trade — unlike the init lock, which
+    guards a potentially-slow first-connect path and must never wedge the
+    dispatcher's tick.
+    """
+    board_json_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = board_json_path.with_name(board_json_path.name + ".lock")
+    if _IS_WINDOWS:
+        import msvcrt
+
+        handle = lock_path.open("a+b")
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            handle.close()
+    else:
+        import fcntl
+
+        handle = lock_path.open("a+b")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def _default_board_display_name(slug: str) -> str:
     """``atm10-server`` -> ``Atm10 Server``."""
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
+_BOARD_SAFETY_TOGGLE_FIELDS = (
+    "dispatch_enabled",
+    "auto_decompose_enabled",
+    "review_dispatch_enabled",
+)
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """``board.json`` merged over defaults, plus ``slug`` and ``db_path``. Never
-    raises — a missing/malformed file yields the synthesized entry."""
+    raises — a missing/malformed file yields the synthesized entry.
+
+    A genuinely missing ``board.json`` (new/never-created board) is the
+    normal case and defaults every safety toggle to enabled (``True`` =
+    "inherit global", not "off"). A *present but corrupt/unparsable*
+    ``board.json`` is a different failure class: it means we cannot trust
+    what the operator last set, so the three safety-relevant toggle fields
+    (``dispatch_enabled`` / ``auto_decompose_enabled`` /
+    ``review_dispatch_enabled``) fail CLOSED (default to ``False``) instead
+    of silently re-enabling a board an operator may have deliberately
+    paused. A WARNING is logged with the board slug and the exception so
+    the corruption is visible, not silent.
+    """
     slug = _slug_or_default(board)
     meta: dict[str, Any] = {
         "slug": slug,
@@ -550,17 +612,36 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "auto_decompose_enabled": True,
         "review_dispatch_enabled": True,
     }
+    p = board_metadata_path(slug)
+    file_exists = False
     try:
-        p = board_metadata_path(slug)
-        if p.exists():
+        file_exists = p.exists()
+    except OSError:
+        file_exists = False
+    if file_exists:
+        try:
             raw = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            # File exists but could not be parsed — corruption (e.g. a torn
+            # write), not "no board.json yet". Fail closed on the
+            # safety-relevant toggles rather than silently re-enabling
+            # dispatch/auto-decompose/review-dispatch on a board an
+            # operator may have paused.
+            _log.warning(
+                "board.json for board %r exists but failed to parse (%s: %s) — "
+                "failing CLOSED on dispatch_enabled/auto_decompose_enabled/"
+                "review_dispatch_enabled for this read rather than silently "
+                "re-enabling a possibly-paused board.",
+                slug, type(exc).__name__, exc,
+            )
+            for field in _BOARD_SAFETY_TOGGLE_FIELDS:
+                meta[field] = False
+        else:
             if isinstance(raw, dict):
                 # Never let the metadata file claim a different slug than
                 # its directory — trust the filesystem.
                 raw["slug"] = slug
                 meta.update(raw)
-    except (OSError, json.JSONDecodeError):
-        pass
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
 
@@ -580,32 +661,44 @@ def write_board_metadata(
     """
     _assert_not_delegated_child_mutation()
     slug = _slug_or_default(board)
-    meta = read_board_metadata(slug)
-    # db_path is derived on every read; never persist it into board.json.
-    meta.pop("db_path", None)
-    if name is not None:
-        meta["name"] = str(name).strip() or _default_board_display_name(slug)
-    for key, value in (("description", description), ("icon", icon), ("color", color)):
-        if value is not None:
-            meta[key] = str(value)
-    if archived is not None:
-        meta["archived"] = bool(archived)
-    if dispatch_enabled is not None:
-        meta["dispatch_enabled"] = bool(dispatch_enabled)
-    if auto_decompose_enabled is not None:
-        meta["auto_decompose_enabled"] = bool(auto_decompose_enabled)
-    if review_dispatch_enabled is not None:
-        meta["review_dispatch_enabled"] = bool(review_dispatch_enabled)
-    for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
-        if value is not None:
-            meta[key] = str(value) if value else None
-    if not meta.get("created_at"):
-        meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
-    )
+    # Serialize the whole read-modify-write cycle per board so concurrent
+    # writers (CLI boards set-dispatch/set-auto-decompose/set-review-dispatch/
+    # rename, the dashboard's PATCH /boards/{slug}, kanban_transfer import,
+    # projects_cmd) cannot interleave and clobber each other's field changes
+    # (last-writer-wins on the WHOLE dict, not just the field each writer
+    # intended to change). Matches the style of
+    # ``kanban_db_connect._cross_process_init_lock``.
+    with _board_metadata_lock(path):
+        meta = read_board_metadata(slug)
+        # db_path is derived on every read; never persist it into board.json.
+        meta.pop("db_path", None)
+        if name is not None:
+            meta["name"] = str(name).strip() or _default_board_display_name(slug)
+        for key, value in (("description", description), ("icon", icon), ("color", color)):
+            if value is not None:
+                meta[key] = str(value)
+        if archived is not None:
+            meta["archived"] = bool(archived)
+        if dispatch_enabled is not None:
+            meta["dispatch_enabled"] = bool(dispatch_enabled)
+        if auto_decompose_enabled is not None:
+            meta["auto_decompose_enabled"] = bool(auto_decompose_enabled)
+        if review_dispatch_enabled is not None:
+            meta["review_dispatch_enabled"] = bool(review_dispatch_enabled)
+        for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
+            if value is not None:
+                meta[key] = str(value) if value else None
+        if not meta.get("created_at"):
+            meta["created_at"] = int(time.time())
+        # Atomic temp-file + fsync + os.replace: a crash/kill mid-write can
+        # never leave a truncated/corrupt board.json. Matches the shared
+        # ``utils.atomic_write_text`` pattern used elsewhere (active_sessions.py,
+        # copilot_auth.py, banner.py, ...).
+        atomic_write_text(
+            path, json.dumps(meta, indent=2, ensure_ascii=False) + "\n", tmp_prefix=".board_",
+        )
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
 
