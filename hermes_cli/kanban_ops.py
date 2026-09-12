@@ -90,14 +90,23 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            # Threaded through so this call site gets the same board-level
+            # gates (F1 batch approval, F5 dispatch_enabled) the gateway
+            # sweep already applies — previously the CLI path called
+            # dispatch_once with no board at all, silently bypassing both.
+            board=kb.get_current_board(),
         )
     if getattr(args, "json", False):
+        candidates = [
+            {"task_id": tid, "assignee": who, "workspace": ws}
+            for (tid, who, ws) in res.spawned
+        ]
         _print_json({
+            "dry_run": bool(args.dry_run),
             **{k: getattr(res, k)
                for k in ("reclaimed", "crashed", "timed_out", "stale", "auto_blocked", "promoted")},
-            "spawned": [
-                {"task_id": tid, "assignee": who, "workspace": ws} for (tid, who, ws) in res.spawned
-            ],
+            "spawned": [] if args.dry_run else candidates,
+            "planned": candidates if args.dry_run else [],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
             "skipped_per_profile_capped": [
@@ -118,7 +127,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         if items:
             print(f"  {', '.join(items)}")
     print(f"Promoted:     {res.promoted}")
-    print(f"Spawned:      {len(res.spawned)}")
+    print(f"{'Planned:      ' if args.dry_run else 'Spawned:      '}{len(res.spawned)}")
     tag = " (dry)" if args.dry_run else ""
     for tid, who, ws in res.spawned:
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")

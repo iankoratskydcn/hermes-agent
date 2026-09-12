@@ -64,10 +64,44 @@ def test_promote_stuck_todo_succeeds(conn):
     assert kb.get_task(conn, child).status == "ready"
 
 
+def test_promote_refuses_undone_parent_and_names_the_real_remedy(conn):
+    # #106195: promotion must never report a 'ready' that the first claim reverts.
+    child, (parent,) = _stuck_todo(conn, parents_done=False)
+    ok, err = kb.promote_task(conn, child, actor="tester", reason="recovery")
+    assert not ok
+    assert parent in err and "--force" not in err and f"unlink <parent_id> {child}" in err
+    assert kb.get_task(conn, child).status == "todo"
+    assert kb.claim_task(conn, child) is None  # still gated; nothing pretended
 
 
+def test_promote_readiness_moves_triage_with_audit_event(conn):
+    task_id = kb.create_task(conn, title="readiness canary", triage=True)
+    ok, err = kb.promote_task(
+        conn, task_id, actor="tester", reason="bounded readiness inspection", readiness=True,
+    )
+    assert ok and err is None
+    assert kb.get_task(conn, task_id).status == "ready"
+    event = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    assert event["kind"] == "promoted_readiness"
+    assert '"readiness": true' in event["payload"]
 
 
+def test_promote_readiness_requires_reason_and_preserves_triage(conn):
+    task_id = kb.create_task(conn, title="readiness canary", triage=True)
+    ok, err = kb.promote_task(conn, task_id, actor="tester", readiness=True)
+    assert not ok
+    assert "audit reason" in err
+    assert kb.get_task(conn, task_id).status == "triage"
+
+
+def test_cli_promote_has_no_force_flag(kanban_home):
+    from hermes_cli import kanban_parser
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    kanban_parser.build_parser(parser.add_subparsers(dest="command"))
+    with pytest.raises(SystemExit):
+        parser.parse_args(["kanban", "promote", "t_x", "--force"])
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +111,7 @@ def test_promote_stuck_todo_succeeds(conn):
 
 
 def _promote_ns(task_id, *, ids=None, reason=None, force=False,
-                dry_run=False, as_json=False):
+                dry_run=False, as_json=False, readiness=False):
     return argparse.Namespace(
         task_id=task_id,
         reason=list(reason or []),
@@ -85,6 +119,7 @@ def _promote_ns(task_id, *, ids=None, reason=None, force=False,
         force=force,
         dry_run=dry_run,
         json=as_json,
+        readiness=readiness,
     )
 
 

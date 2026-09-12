@@ -1656,3 +1656,177 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Wave2/1a: task_mode / ears_sentence / oracle / scope_paths schema columns
+# (schema-foundation only — no dispatch/gate wiring here).
+# ---------------------------------------------------------------------------
+
+_WAVE1A_COLUMNS = ("task_mode", "ears_sentence", "oracle", "scope_paths")
+
+
+def test_fresh_db_has_wave1a_columns(kanban_home):
+    """A freshly-initialised DB's ``tasks`` table carries all four new columns."""
+    conn = kbc.connect()
+    try:
+        cols = kbc._column_names(conn, "tasks")
+        for col in _WAVE1A_COLUMNS:
+            assert col in cols, f"missing column {col!r} on a fresh DB"
+    finally:
+        conn.close()
+
+
+def test_migration_on_db_with_no_wave1a_columns_is_idempotent(kanban_home):
+    """A legacy in-memory schema lacking all four columns migrates cleanly,
+    and running the migration a second time does not error or duplicate."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL DEFAULT '',
+            payload TEXT,
+            created_at INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+
+    # First pass: none of the wave1a columns exist yet.
+    kbc._migrate_add_optional_columns(conn)
+    cols = kbc._column_names(conn, "tasks")
+    for col in _WAVE1A_COLUMNS:
+        assert col in cols
+
+    # Second pass on the now-migrated schema: must not raise or duplicate.
+    kbc._migrate_add_optional_columns(conn)
+    cols_again = kbc._column_names(conn, "tasks")
+    assert cols_again == cols
+    conn.close()
+
+
+def test_migration_on_db_with_some_wave1a_columns_is_idempotent(kanban_home):
+    """A DB that already has SOME (but not all) of the new columns migrates
+    the rest without erroring or duplicating any column."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER,
+            task_mode TEXT,
+            oracle TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL DEFAULT '',
+            payload TEXT,
+            created_at INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+
+    kbc._migrate_add_optional_columns(conn)
+    cols = kbc._column_names(conn, "tasks")
+    for col in _WAVE1A_COLUMNS:
+        assert col in cols
+
+    # Re-running must not error and must not duplicate any column.
+    kbc._migrate_add_optional_columns(conn)
+    cols_again = kbc._column_names(conn, "tasks")
+    assert cols_again == cols
+    conn.close()
+
+
+def test_existing_create_task_call_sites_unaffected_new_fields_default_none(kanban_home):
+    """Existing ``create_task`` call sites (no wave1a kwargs passed) still work,
+    and the new fields read back as ``None`` — proves backward compatibility."""
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(conn, title="legacy call site", body="no new fields")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.task_mode is None
+        assert task.ears_sentence is None
+        assert task.oracle is None
+        assert task.scope_paths is None
+    finally:
+        conn.close()
+
+
+def test_wave1a_fields_round_trip_through_create_and_get_task(kanban_home):
+    """Setting task_mode/ears_sentence/oracle/scope_paths on create_task and
+    reading the task back returns the exact same values."""
+    conn = kbc.connect()
+    try:
+        scope = ["hermes_cli/kanban_db.py", "tests/hermes_cli/test_kanban_db.py"]
+        task_id = kb.create_task(
+            conn,
+            title="schema-foundation task",
+            task_mode="agent",
+            ears_sentence="WHEN a fresh DB is initialised THE SYSTEM SHALL create the wave1a columns.",
+            oracle="scripts/run_tests.sh tests/hermes_cli/ -k kanban",
+            scope_paths=scope,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.task_mode == "agent"
+        assert task.ears_sentence == (
+            "WHEN a fresh DB is initialised THE SYSTEM SHALL create the wave1a columns."
+        )
+        assert task.oracle == "scripts/run_tests.sh tests/hermes_cli/ -k kanban"
+        assert task.scope_paths == scope
+    finally:
+        conn.close()
+
+
+def test_wave1a_scope_paths_none_when_omitted_not_empty_list(kanban_home):
+    """``scope_paths`` defaults to ``None`` (unset), never ``[]`` (explicitly
+    empty), matching the same None-vs-[] semantics already used by ``skills``."""
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(conn, title="no scope paths given")
+        task = kb.get_task(conn, task_id)
+        assert task.scope_paths is None
+    finally:
+        conn.close()

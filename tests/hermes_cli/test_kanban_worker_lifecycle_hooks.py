@@ -39,6 +39,7 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
+    monkeypatch.setattr(kbd, "batch_approval_gate_ok", lambda board=None: (True, "test-bypass"))
     return home
 
 

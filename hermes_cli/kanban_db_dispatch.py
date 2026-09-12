@@ -29,8 +29,17 @@ if TYPE_CHECKING:
 
 
 # After this many consecutive non-success attempts on a task/profile the
-# dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
+# dispatcher parks the task in `blocked` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
+
+# Rule 4 (no-infinite-retry): once a task's consecutive_failures counter
+# reaches this threshold, dispatch escalates to a PO via a decision-hud
+# missing_constraint card instead of retrying it again — independent of
+# (and enforced in addition to) DEFAULT_FAILURE_LIMIT/max_retries above,
+# which may trip the ordinary breaker earlier or later than this. Owner
+# decision: N=3 ("1 retry with the missing constraint, escalate to PO on
+# the 2nd consecutive failure" — i.e. at exactly 3 consecutive failures).
+RETRY_CAP_ESCALATION_THRESHOLD = 3
 
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -110,6 +119,11 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_gate_precheck: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` blocked by the Wave2/2c deterministic gate
+    precheck (``kanban_gate_precheck.gate_precheck``) when the board opts in
+    via ``kanban.gate_precheck_enabled``. Distinct from ``respawn_guarded``
+    (a different mechanism, always-on) so telemetry can tell them apart."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -122,6 +136,15 @@ class DispatchResult:
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
     within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    retry_cap_blocked: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` refused by Rule 4 (no-infinite-retry): the task
+    hit ``consecutive_failures >= RETRY_CAP_ESCALATION_THRESHOLD`` (3) and has
+    an unresolved decision-hud ``missing_constraint`` card open for it (either
+    just pushed this tick, or pushed on an earlier tick and still pending PO
+    resolution). Distinct from ``respawn_guarded`` (a different, always-on
+    mechanism) so telemetry can tell the two apart. Fails CLOSED: a
+    decision-hud error/unavailability at or above the threshold also lands
+    here, never a silent dispatch."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -133,6 +156,15 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    gate_blocked: Optional[str] = None
+    """Set when this tick did NOTHING (no reclaim, no claim, no spawn)
+    because a dispatch gate refused it: ``"board_dispatch_disabled"`` (F5,
+    the board's own ``dispatch_enabled`` toggle) or
+    ``"batch_approval_required"`` (F1, decision-hud's
+    ``require_batch_approval`` — see :func:`batch_approval_gate_ok`). Both
+    gates are enforced once, in :func:`dispatch_once`, so every real
+    dispatch entry point (CLI, dashboard, gateway sweep, standalone daemon)
+    inherits them without each caller re-implementing the check."""
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -1256,15 +1288,35 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return _has_spawnable(conn, "review")
 
 
-def review_dispatch_enabled() -> bool:
+def review_dispatch_enabled(board: Optional[str] = None) -> bool:
     """Whether review tasks dispatch automatically. Default true (Hermes ships
     ``sdlc-review``); operators disable it for human-only review boards.
+
+    ``board`` applies a per-board override on top of the global switch
+    (narrowing-only, same semantics as ``dispatch_enabled``/
+    ``auto_decompose_enabled`` in board.json): a disabled global switch
+    always wins; an enabled global switch defers to the board's own flag
+    when the caller supplies one.
     """
     try:
         from hermes_cli.config import load_config
-        return bool((load_config() or {}).get("kanban", {}).get("review_dispatch", True))
+        global_enabled = bool((load_config() or {}).get("kanban", {}).get("review_dispatch", True))
     except Exception:
-        return True
+        global_enabled = True
+    if not global_enabled or board is None:
+        return global_enabled
+    try:
+        from hermes_cli import kanban_db
+        return bool(kanban_db.read_board_metadata(board).get("review_dispatch_enabled", True))
+    except Exception:
+        # Fail CLOSED: this is a safety gate, not a display default. A read/
+        # parse error here must never resolve to "dispatch anyway" — that
+        # silently reinstates the exact race the toggle exists to prevent.
+        # (Note: read_board_metadata() itself already swallows OSError/
+        # JSONDecodeError and returns a safe default dict, so this branch is
+        # a last-resort net for an unexpected failure, e.g. kanban_db being
+        # unimportable — it must not be reached in the common case.)
+        return False
 
 
 # Memory-aware dispatch guard: an uncapped board once OOM'd a 1 GiB host. Two
@@ -1415,6 +1467,181 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+# --- F1/F5 dispatch gates: enforced ONCE, in dispatch_once(), so every real
+# entry point (CLI, dashboard, gateway sweep, standalone daemon) inherits
+# them automatically. Both fail CLOSED on any read/parse error. ------------
+
+def _resolve_gate_board(board: Optional[str]) -> Optional[str]:
+    """Resolve ``board=None`` to the actual board a ``None``-board dispatch
+    call targets, so the gate checks the SAME board.json that
+    ``kanban_db_path(board=None)`` resolves to (via ``get_current_board()``)
+    instead of silently skipping the check for the common no-``--board``
+    call shape. Falls back to ``None`` only if the current board itself
+    can't be resolved at all (no board context whatsoever) — callers treat
+    that as "no board to gate", not as an escape hatch from the
+    default-gated policy below.
+    """
+    if board is not None:
+        return board
+    try:
+        return _kb.get_current_board()
+    except Exception:
+        return None
+
+
+def _board_dispatch_gate_ok(board: Optional[str]) -> bool:
+    """F5: per-board ``dispatch_enabled`` toggle, enforced at the one real
+    choke point instead of only in the gateway sweep's own pre-check.
+
+    ``board`` resolves through :func:`_resolve_gate_board` first so a
+    ``None``-board caller (e.g. ``hermes kanban dispatch`` with no
+    ``--board``) is checked against the SAME board its dispatch actually
+    targets, not silently skipped. Any failure to read the toggle fails
+    CLOSED (dispatch is refused), matching ``review_dispatch_enabled``'s
+    fail-closed exception path above.
+    """
+    resolved = _resolve_gate_board(board)
+    if resolved is None:
+        return True
+    try:
+        return bool(_kb.read_board_metadata(resolved).get("dispatch_enabled", True))
+    except Exception:
+        return False
+
+
+def _retry_cap_gate_ok(board: Optional[str], task_id: str, consecutive_failures: int) -> tuple[bool, str]:
+    """Rule 4 (no-infinite-retry) per-task gate. Returns ``(True, "")`` when
+    the task is clear to dispatch; ``(False, reason)`` when it must be
+    refused this tick.
+
+    Below :data:`RETRY_CAP_ESCALATION_THRESHOLD` this is always a no-op
+    ``(True, "")`` — the ordinary breaker (``_record_task_failure`` /
+    ``DEFAULT_FAILURE_LIMIT`` / per-task ``max_retries``) is the only
+    mechanism that applies there, unchanged.
+
+    At or above the threshold: push a decision-hud ``missing_constraint``
+    card for this exact ``(project, task_id)`` if one isn't already open
+    (``push_task_missing_constraint`` — a no-op, not an error, when one
+    already exists per the bridge's documented duplicate handling), then
+    check whether it is resolved. Unresolved (including "just pushed this
+    tick") -> refuse. Resolved -> clear to dispatch again.
+
+    Same fail-closed contract as F1's ``batch_approval_gate_ok``: a
+    ``project`` that cannot be resolved, or any decision-hud error/
+    unavailability, is treated as NOT resolved (refuse), never as "skip the
+    check".
+    """
+    if consecutive_failures < RETRY_CAP_ESCALATION_THRESHOLD:
+        return True, ""
+    project = _resolve_gate_board(board)
+    if project is None:
+        return False, (
+            "no board context resolvable — cannot check/push a Rule 4 "
+            "missing_constraint decision, failing closed"
+        )
+    try:
+        from hermes_cli.plugin_bridges import decision_hud as _dh_bridge
+    except Exception as exc:
+        return False, f"decision-hud bridge unavailable: {exc}"
+    # Check resolution FIRST: decision-hud allows a fresh push once the
+    # existing row is resolved (a task can legitimately hit an independent
+    # 2nd escalation later), so pushing unconditionally here would re-open a
+    # brand-new unresolved row on every tick after the PO already resolved
+    # it, re-blocking a task that should now be clear to dispatch.
+    try:
+        if _dh_bridge.check_constraint_resolved(project=project, task_id=task_id):
+            return True, ""
+    except Exception as exc:
+        return False, f"missing_constraint resolution check failed: {exc}"
+    question = (
+        f"Task {task_id!r} has failed {consecutive_failures} consecutive times. "
+        "What constraint/spec is missing, or how should it proceed?"
+    )
+    try:
+        pushed, push_reason = _dh_bridge.push_task_missing_constraint(
+            project=project, task_id=task_id, question=question,
+        )
+    except Exception as exc:
+        return False, f"missing_constraint push failed: {exc}"
+    if pushed:
+        return False, (
+            f"task {task_id!r} hit {consecutive_failures} consecutive failures; "
+            "pushed a decision-hud missing_constraint card, awaiting PO resolution"
+        )
+    return False, (
+        f"task {task_id!r} hit {consecutive_failures} consecutive failures; "
+        f"missing_constraint still unresolved ({push_reason})"
+    )
+
+
+def batch_approval_gate_ok(board: Optional[str]) -> tuple[bool, str]:
+    """F1: decision-hud's ``require_batch_approval()`` gate, checked before
+    ANY task claim/spawn on this board. ``(ok, reason)``.
+
+    Default-gated (per owner decision, superseding the earlier opt-in
+    design): every board must have a ``batch_approval_gate`` field in
+    ``board.json`` (``{"project": ..., "batch_id": ...}``) pointing at an
+    APPROVED decision-hud batch, or dispatch is refused outright — there is
+    no "no gate configured -> proceed" path any more. An operator opts a
+    board INTO dispatch by pushing+approving a batch and wiring its
+    (project, batch_id) onto the board via ``hermes kanban boards
+    set-batch-gate``; there is no way to opt a board OUT of requiring this.
+
+    Single-use / self-clearing: once a check here passes (batch is
+    APPROVED) and the calling ``dispatch_once`` tick actually proceeds past
+    the gate, the gate is atomically cleared back to unset so the NEXT tick
+    starts ungated again — matching the original "PO approves this batch of
+    tasks" intent (one approval authorizes one dispatch cycle, not
+    indefinite future dispatch). The operator must push+approve a fresh
+    batch for every subsequent round. Clearing happens in
+    :func:`dispatch_once` immediately after this returns ``True``, not here
+    (this function is a pure read).
+
+    When configured, this calls straight into decision-hud's own
+    ``require_batch_approval()`` (no vendored copy of its approve/reject/
+    pending logic) via ``hermes_cli.plugin_bridges.decision_hud`` — the
+    plugin lives at ``~/.hermes/plugins/decision-hud`` (a standalone,
+    non-git-tracked-at-that-path install; NOT importable as a normal
+    package), so the bridge locates and imports it by absolute file path.
+
+    ``board`` resolves through :func:`_resolve_gate_board` first, same
+    reasoning as :func:`_board_dispatch_gate_ok`.
+
+    Fails CLOSED in every case: no gate configured -> BLOCK (this is now
+    the default-gated mandate, not a display default); gate configured but
+    decision-hud unimportable, DB unreadable, or the batch
+    missing/pending/rejected -> BLOCK. An exception here must never resolve
+    to "dispatch anyway".
+    """
+    resolved = _resolve_gate_board(board)
+    if resolved is None:
+        return False, "no board context resolvable — cannot verify a batch_approval_gate, failing closed"
+    try:
+        gate = _kb.read_board_metadata(resolved).get("batch_approval_gate")
+    except Exception as exc:
+        return False, f"could not read board metadata: {exc}"
+    if not gate:
+        return False, (
+            f"no batch_approval_gate configured for board {resolved!r} — "
+            "dispatch is default-gated: an operator must push+approve a "
+            "decision-hud batch for this board before any task may be "
+            "claimed or spawned (hermes kanban boards set-batch-gate)"
+        )
+    if not isinstance(gate, dict) or not gate.get("project") or not gate.get("batch_id"):
+        return False, f"malformed batch_approval_gate on board {resolved!r}: {gate!r}"
+    try:
+        from hermes_cli.plugin_bridges import decision_hud as _dh_bridge
+    except Exception as exc:
+        return False, f"decision-hud bridge unavailable: {exc}"
+    try:
+        ok, reason = _dh_bridge.check_batch_approval(
+            project=str(gate["project"]), batch_id=str(gate["batch_id"]),
+        )
+    except Exception as exc:
+        return False, f"batch approval check failed: {exc}"
+    return ok, reason
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -1437,7 +1664,75 @@ def dispatch_once(
     frames. The loser returns an empty ``DispatchResult`` with
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
+
+    This is the SINGLE canonical choke point for task claim/spawn (F1/F5):
+    every real dispatch entry point — ``hermes kanban dispatch`` (CLI,
+    ``kanban_ops.py``), the dashboard's ``POST /dispatch``
+    (``plugins/kanban/dashboard/plugin_api.py``), the gateway's embedded
+    sweep (``gateway/kanban_watchers_dispatcher.py``), and the standalone
+    ``run_daemon`` loop below — all call ``dispatch_once``; nothing outside
+    this module (and its tests) calls ``_dispatch_once_locked`` directly.
+    Gating here, before the lock is even taken, means no caller can bypass
+    it by skipping a wrapper: both checks run FIRST, unconditionally, and a
+    read/parse failure on either fails CLOSED (refuses to dispatch), never
+    open. board=None (the legacy no-board caller) skips the board-level gate
+    (there is no board to gate) but a global config value can still refuse
+    to run below.
     """
+    if not _board_dispatch_gate_ok(board):
+        result = DispatchResult(gate_blocked="board_dispatch_disabled")
+        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+        return result
+    batch_ok, batch_reason = batch_approval_gate_ok(board)
+    if not batch_ok:
+        _kb._log.warning(
+            "kanban dispatch: board %r blocked by decision-hud batch approval gate: %s",
+            board, batch_reason,
+        )
+        result = DispatchResult(gate_blocked="batch_approval_required")
+        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+        return result
+    # The gate passed for THIS tick. Per owner decision, an approval is
+    # single-use: it authorizes one dispatch cycle, not indefinite future
+    # dispatch, matching the original "PO approves this batch of tasks"
+    # intent. Consume it now (clear board.json's batch_approval_gate) —
+    # unconditionally, not deferred until after the locked tick — so a
+    # concurrent resolve/inspect of board.json can never observe a
+    # "gate still set but already spent" state, and so the consumption
+    # can't be skipped by an exception during the tick itself. dry_run
+    # ticks do NOT consume the gate (no real dispatch happened); a
+    # skipped_locked tick (another dispatcher won the lock) also must not
+    # consume it here, since THIS process never actually used the
+    # approval — deferred to right before the lock attempt so we still
+    # know whether we're a dry run, but before we know if we'll win the
+    # lock, is deliberately impossible to get race-free without holding
+    # the board lock too, so instead we scope consumption to "this call
+    # passed the gate and is not a dry run", accepting that a lock-losing
+    # dry-run-false tick still consumes the gate even though it didn't
+    # spawn anything this instant — the alternative (deferring past the
+    # lock) reintroduces a window where two callers can both read
+    # "approved" and both proceed to spawn before either clears it.
+    _gate_board = _resolve_gate_board(board)
+    if not dry_run and _gate_board is not None:
+        try:
+            _kb.write_board_metadata(_gate_board, batch_approval_gate=None)
+        except Exception:
+            # Consumption failing must not un-gate future ticks by
+            # accident, but it also must not silently re-arm the gate —
+            # log loudly; the NEXT tick will re-check batch_approval_gate_ok
+            # and, since we could not clear it, will see it still set and
+            # ask decision-hud again (this batch is likely still APPROVED,
+            # so the next tick would pass too — not a security hole, just
+            # means the "one approval, one cycle" contract slipped by one
+            # extra tick on a write failure, which is logged for the
+            # operator to notice).
+            _kb._log.warning(
+                "kanban dispatch: board %r batch approval gate could not be "
+                "cleared after a passing check — the approval may authorize "
+                "an extra dispatch tick beyond the intended single use",
+                _gate_board,
+            )
+
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
             conn,
@@ -1536,6 +1831,37 @@ def _dispatch_lane_task(
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
+
+    # Rule 4 (no-infinite-retry): once consecutive_failures hits
+    # RETRY_CAP_ESCALATION_THRESHOLD, escalate to a PO via decision-hud
+    # instead of letting the ordinary breaker's retry budget keep respawning
+    # it. Same fail-closed contract as F1's batch_approval_gate: an error
+    # anywhere in this check refuses the task, never dispatches it anyway.
+    failures_row = conn.execute(
+        "SELECT consecutive_failures FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    consecutive_failures = int(failures_row["consecutive_failures"]) if failures_row is not None else 0
+    retry_ok, retry_reason = _retry_cap_gate_ok(board, task_id, consecutive_failures)
+    if not retry_ok:
+        result.retry_cap_blocked.append((task_id, retry_reason))
+        if not dry_run:
+            with _kb.write_txn(conn):
+                _kb._append_event(conn, task_id, "retry_cap_blocked", {"reason": retry_reason})
+        return False
+
+    # Wave2/2c: deterministic gate precheck, opt-in per board via
+    # kanban.gate_precheck_enabled (default False — unlike F1's default-gated
+    # batch-approval check, this is a new, unproven heuristic with a
+    # materially different risk profile, so a board must explicitly turn it
+    # on). Distinct bucket (skipped_gate_precheck) from respawn_guarded so
+    # telemetry can tell the two mechanisms apart.
+    if bool(_kb.read_board_metadata(board).get("gate_precheck_enabled", False)):
+        task_for_precheck = _kb.get_task(conn, task_id)
+        if task_for_precheck is not None:
+            precheck = _gate_precheck.gate_precheck(task_for_precheck)
+            if precheck["status"] == _gate_precheck.STATUS_BLOCKED:
+                result.skipped_gate_precheck.append((task_id, precheck["reason"]))
+                return False
 
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
@@ -1781,7 +2107,7 @@ def _dispatch_once_locked(
     ready_rows = _lane_rows(conn, "ready")
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
-    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled(board=board) else []
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
@@ -2037,15 +2363,24 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
     if not hermes_home:
         return None
     try:
+        from agent.secret_scope import (
+            build_profile_secret_scope, is_multiplex_active, reset_secret_scope, set_secret_scope)
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_cli.config import load_config
         from hermes_cli.tools_config import _get_platform_tools
 
         token = set_hermes_home_override(hermes_home)
+        # Toolset availability probes read credentials (``get_secret``); under multiplex an
+        # unscoped read raises and the pin was silently dropped for every worker.
+        secret_token = (
+            set_secret_scope(build_profile_secret_scope(Path(hermes_home)))
+            if is_multiplex_active() else None)
         try:
             cfg = load_config()
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
         finally:
+            if secret_token is not None:
+                reset_secret_scope(secret_token)
             reset_hermes_home_override(token)
         return toolsets or None
     except Exception as exc:
@@ -2137,17 +2472,23 @@ def _open_worker_log(task: Task, board: Optional[str]):
 
 
 def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
-    """Wrap a managed-gateway worker in the shared restart-safe scope."""
+    """Wrap a managed-gateway worker in the shared restart-safe scope.
+
+    Kanban workers are long-lived agentic runs, so they never take cron's
+    degraded mode: ``require_restart_safe_scope=True`` makes the helper raise.
+    """
     from tools.process_registry import restart_safe_gateway_child_argv
 
     if task.current_run_id is None:
         # Outside managed systemd this is harmless, but a managed dispatch must
-        # never mint an untraceable scope.  Check topology through the shared
+        # never mint an untraceable worker.  Check topology through the shared
         # helper first, using a placeholder suffix that cannot be launched.
-        scoped = restart_safe_gateway_child_argv(
-            command, unit_suffix=f"kanban-{task.id}-run-missing"
+        dispatch = restart_safe_gateway_child_argv(
+            command,
+            unit_suffix=f"kanban-{task.id}-run-missing",
+            require_restart_safe_scope=True,
         )
-        if scoped is not command:
+        if dispatch.mode != "in_process":
             raise RuntimeError(
                 "cannot create restart-safe systemd scope for Kanban worker: "
                 "the claimed task has no current run id"
@@ -2157,7 +2498,8 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     return restart_safe_gateway_child_argv(
         command,
         unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
-    )
+        require_restart_safe_scope=True,
+    ).argv
 
 
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
@@ -2177,7 +2519,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     profile_arg = normalize_profile_name(task.assignee)
 
     from agent.secret_scope import is_multiplex_active
-    from tools.environments.local import build_subprocess_env
+    from tools.environments.local import build_subprocess_env, strip_launch_profile_env
 
     env = build_subprocess_env(
         scrub_secrets=is_multiplex_active(),
@@ -2195,6 +2537,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # hermes_constants is imported.
     try:
         env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        # A multiplexer dispatching for another profile must not hand it the launch
+        # profile's .env settings / TERMINAL_* policy — a standalone dispatcher never would.
+        strip_launch_profile_env(env, env["HERMES_HOME"])
     except FileNotFoundError:
         # No profile dir (isolated test fixtures) — the CLI resolves it from
         # HERMES_PROFILE (set below) instead.
@@ -2258,6 +2603,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
     cmd = _restart_safe_worker_argv(task, cmd)
+    from tools.process_registry import systemd_user_bus_env
+    env = systemd_user_bus_env(env)
     log_f = _open_worker_log(task, board)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
@@ -2345,3 +2692,4 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
+from hermes_cli import kanban_gate_precheck as _gate_precheck  # noqa: E402

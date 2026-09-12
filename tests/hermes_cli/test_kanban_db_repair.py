@@ -210,6 +210,10 @@ def test_dispatch_tick_runs_wal_checkpoint_at_interval(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     # Fresh per-path clock so previous tests can't have claimed the slot.
     monkeypatch.setattr(kbc, "_LAST_WAL_CHECKPOINT", {})
+    # F1 (default-gated dispatch): this test exercises the WAL checkpoint
+    # cadence via dry_run dispatch_once() ticks, not batch approval — bypass
+    # the orthogonal gate so ticks actually run.
+    monkeypatch.setattr(kbd, "batch_approval_gate_ok", lambda board=None: (True, "test-bypass"))
 
     executed: list[str] = []
     conn = kbc.connect(db_path=db_path)
@@ -266,6 +270,7 @@ def cli_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(kbd, "batch_approval_gate_ok", lambda board=None: (True, "test-bypass"))
     return home
 
 

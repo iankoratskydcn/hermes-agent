@@ -103,13 +103,42 @@ _BOARD_SPECS = [
                   "Default is to move it to boards/_archived/ so it's recoverable."),
     ], aliases=["remove", "delete"], help="Archive (default) or delete a board"),
     _cmd("switch", [_SLUG], aliases=["use"], help="Set the active board for subsequent CLI calls"),
-    _cmd("show", aliases=["current"], help="Print the currently-active board slug"),
+    _cmd("show", [
+        _arg("slug", nargs="?", help="Board slug to show (default: the current board)"),
+        _json_flag(),
+    ], aliases=["current"], help="Print the currently-active board slug"),
     _cmd("rename", [_SLUG, _arg("name", help="New display name")],
          help="Change a board's human-readable display name (slug is immutable)"),
     _cmd("set-default-workdir", [
         _SLUG,
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
+    _cmd("set-dispatch", [
+        _SLUG,
+        _arg("state", choices=("on", "off"), help="Enable or disable dispatcher sweeps for this board"),
+    ], help="Toggle this board's override of the global kanban dispatcher"),
+    _cmd("set-auto-decompose", [
+        _SLUG,
+        _arg("state", choices=("on", "off"), help="Enable or disable auto-decompose for this board"),
+    ], help="Toggle this board's override of the global kanban auto-decompose"),
+    _cmd("set-review-dispatch", [
+        _SLUG,
+        _arg("state", choices=("on", "off"), help="Enable or disable review-lane dispatch for this board"),
+    ], help="Toggle this board's override of the global kanban review-dispatch"),
+    _cmd("set-batch-gate", [
+        _SLUG,
+        _arg("project", nargs="?", help="decision-hud project name for the batch_approval card. Omit (with no --clear) to inspect current state."),
+        _arg("batch_id", nargs="?", help="decision-hud batch_id for the batch_approval card"),
+        _arg("--clear", action="store_true", help="Remove this board's batch_approval_gate instead of setting one"),
+        _json_flag(),
+    ], help="Point this board's dispatch gate at a decision-hud batch (F1: default-gated dispatch)", description=(
+        "Every board's dispatch is default-gated: dispatch_once() refuses to claim or spawn any "
+        "task until board.json's batch_approval_gate names an APPROVED decision-hud batch "
+        "(project, batch_id). Push and approve a batch first (hermes decision push-batch / "
+        "the Decision HUD desktop pane), then wire it here. The gate is single-use — a passing "
+        "check consumes it (clears batch_approval_gate back to unset) after one dispatch cycle, "
+        "so this command must be run again before the next round of work."
+    )),
     _cmd("export", [
         _arg("slug", nargs="?", help="Board to export (default: the current board)"),
         _arg("-o", "--output", help="Archive path (default: ./<slug>.tar.gz)"),
@@ -150,8 +179,9 @@ _SPECS = [
         _arg("--body", help="Optional opening post"),
         _arg("--assignee", help="Profile name to assign"),
         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
-        _arg("--workspace", default="scratch",
-             help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch)"),
+        _arg("--workspace",
+             help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch; "
+                  "an explicit 'scratch' also opts out of a project-scoped board's project)"),
         _arg("--branch", help="Branch name for worktree tasks, e.g. wt/t6-wire"),
         _arg("--project",
              help="Link to a project (id or slug). Anchors the task's "
@@ -328,10 +358,11 @@ _SPECS = [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
         _bulk_ids("promote"),
-        _arg("--force", action="store_true", help="Promote even if parent dependencies are not yet done/archived"),
+        _arg("--readiness", action="store_true",
+             help="Explicitly move a triage task to ready for a bounded readiness canary; requires an audit reason"),
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
-    ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
+    ], help="Manually move tasks to ready (todo/blocked recovery or explicit triage readiness canary)"),
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",

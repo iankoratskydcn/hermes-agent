@@ -29,6 +29,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
+from hermes_cli.web_read_coalescing import coalesced_read
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
@@ -263,7 +264,6 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 
 # --- GET /board -------------------------------------------------------------
 
-@router.get("/board")
 def get_board(
     tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
     include_archived: bool = Query(False),
@@ -315,6 +315,27 @@ def get_board(
             "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
 
 
+_read_board = coalesced_read(get_board)
+
+
+@router.get("/board")
+async def get_board_endpoint(
+    tenant: Optional[str] = Query(None, description="Filter to a single tenant"),
+    include_archived: bool = Query(False),
+    board: Optional[str] = _BOARD_Q,
+    workflow_template_id: Optional[str] = Query(None, description="Restrict to tasks using this workflow template id"),
+    current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key"),
+):
+    # Resolve selection before keying so a board switch cannot join an older read.
+    return await _read_board(
+        tenant=tenant,
+        include_archived=include_archived,
+        board=board or kanban_db.get_current_board(),
+        workflow_template_id=workflow_template_id,
+        current_step_key=current_step_key,
+    )
+
+
 # --- GET /tasks/:id ---------------------------------------------------------
 
 @router.get("/tasks/{task_id}")
@@ -355,7 +376,7 @@ class CreateTaskBody(BaseModel):
     assignee: Optional[str] = None
     tenant: Optional[str] = None
     priority: int = 0
-    workspace_kind: str = "scratch"
+    workspace_kind: Optional[str] = None  # None = scratch, or the board project's worktree when scoped
     workspace_path: Optional[str] = None
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
@@ -1238,6 +1259,11 @@ class RenameBoardBody(BaseModel):
     # For both fields: ``None`` = leave unchanged; "" = clear; value = validate/resolve + set.
     default_workdir: Optional[str] = None
     project_id: Optional[str] = None
+    # Per-board narrowing-only overrides of the global kanban.dispatch_in_gateway /
+    # kanban.auto_decompose / kanban.review_dispatch switches. None = leave unchanged.
+    dispatch_enabled: Optional[bool] = None
+    auto_decompose_enabled: Optional[bool] = None
+    review_dispatch_enabled: Optional[bool] = None
 
 
 # Board transfer exchanges filesystem PATHS, not bytes (same contract as profile export/import):
@@ -1391,7 +1417,9 @@ def rename_board(slug: str, payload: RenameBoardBody):
         else:
             project_id = ""  # clear the scope
     meta = kanban_db.write_board_metadata(
-        normed, default_workdir=default_workdir, project_id=project_id, **_board_display_kwargs(payload))
+        normed, default_workdir=default_workdir, project_id=project_id,
+        dispatch_enabled=payload.dispatch_enabled, auto_decompose_enabled=payload.auto_decompose_enabled,
+        review_dispatch_enabled=payload.review_dispatch_enabled, **_board_display_kwargs(payload))
     return {"board": _annotate_board_meta(meta)}
 
 
