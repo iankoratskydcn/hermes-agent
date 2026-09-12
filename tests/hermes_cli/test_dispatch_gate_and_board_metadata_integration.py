@@ -111,17 +111,33 @@ def _no_spawn(*args, **kwargs):
     )
 
 
+def _ensure_decision_hud_project(project_id: str) -> None:
+    """Create a real row in hermes_cli.projects_db for ``project_id`` so
+    decision-hud's v6 ``_resolve_project`` FK-style validation (any push/
+    query against an unknown project_id is a hard error, by design) doesn't
+    reject test fixtures. decision-hud resolves project_id by exact slug/id
+    match, so the fixture creates a project whose slug IS project_id.
+    """
+    from hermes_cli import projects_db
+
+    with projects_db.connect_closing() as conn:
+        if projects_db.get_project(conn, project_id) is not None:
+            return
+        projects_db.create_project(conn, name=project_id, slug=project_id)
+
+
 def _push_batch(project: str, batch_id: str, *, task_list=None):
     """Push a real batch_approval decision through the real decision-hud
     db.py (loaded via the real hermes_cli.plugin_bridges.decision_hud
     bridge's own path-resolution logic), not a hand-rolled fixture."""
     from hermes_cli.plugin_bridges import decision_hud as bridge
 
+    _ensure_decision_hud_project(project)
     db = bridge._load_decision_hud_db()
     conn = db.connect()
     try:
         return db.push_batch_approval(
-            conn, project=project, batch_id=batch_id, task_list=list(task_list or ["t1"]),
+            conn, project_id=project, batch_id=batch_id, task_list=list(task_list or ["t1"]),
         )
     finally:
         conn.close()
@@ -135,7 +151,7 @@ def _resolve_batch(project: str, batch_id: str, choice: str):
     db = bridge._load_decision_hud_db()
     conn = db.connect()
     try:
-        row = db.get_batch_approval(conn, project=project, batch_id=batch_id)
+        row = db.get_batch_approval(conn, project_id=project, batch_id=batch_id)
         assert row is not None, "test setup: batch row must exist before resolving"
         token = db.issue_actor_token("test-po")
         return db.resolve_decision(conn, row["id"], choice, actor_token=token)
@@ -149,6 +165,7 @@ def _resolve_batch(project: str, batch_id: str, choice: str):
 
 class TestF1BatchApprovalGate:
     def _setup_board_with_gate(self, project="proj-f1", batch_id="batch-1"):
+        _ensure_decision_hud_project(project)
         kb.create_board("proj")
         kb.write_board_metadata(
             "proj", batch_approval_gate={"project": project, "batch_id": batch_id},

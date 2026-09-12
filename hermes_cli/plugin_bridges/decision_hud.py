@@ -77,7 +77,7 @@ def push_task_missing_constraint(
     try:
         conn = db.connect()
         db.push_missing_constraint(
-            conn, project=project, task_id=task_id, question=question, urgency=urgency,
+            conn, project_id=project, task_id=task_id, question=question, urgency=urgency,
         )
         return True, ""
     except ValueError as exc:
@@ -111,7 +111,7 @@ def check_constraint_resolved(*, project: str, task_id: str) -> bool:
     conn: Optional[sqlite3.Connection] = None
     try:
         conn = db.connect()
-        db.require_constraint_resolved(conn, project=project, task_id=task_id)
+        db.require_constraint_resolved(conn, project_id=project, task_id=task_id)
         return True
     except db.ConstraintNotResolved:
         return False
@@ -140,7 +140,7 @@ def check_batch_approval(*, project: str, batch_id: str) -> tuple[bool, str]:
     conn: Optional[sqlite3.Connection] = None
     try:
         conn = db.connect()
-        db.require_batch_approval(conn, project=project, batch_id=batch_id)
+        db.require_batch_approval(conn, project_id=project, batch_id=batch_id)
         return True, ""
     except db.BatchNotApproved as exc:
         return False, str(exc)
@@ -172,7 +172,7 @@ def push_problem_report(
     conn: Optional[sqlite3.Connection] = None
     try:
         conn = db.connect()
-        row = db.push_problem_report(conn, project=project, problem=problem, context=context, reporter=reporter)
+        row = db.push_problem_report(conn, project_id=project, problem=problem, context=context, reporter=reporter)
         return True, str(row.get("id", ""))
     except Exception as exc:
         return False, f"problem report push failed: {exc}"

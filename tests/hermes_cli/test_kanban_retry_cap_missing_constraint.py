@@ -89,16 +89,36 @@ def _stub_spawn(task, workspace, board=None):
     return 424242
 
 
+def _ensure_decision_hud_project(project_id: str) -> None:
+    """Create a real row in hermes_cli.projects_db for ``project_id`` so
+    decision-hud's v6 project_id FK-style validation doesn't reject the
+    dispatcher's real push_task_missing_constraint() call during these tests.
+    """
+    from hermes_cli import projects_db
+
+    with projects_db.connect_closing() as conn:
+        if projects_db.get_project(conn, project_id) is not None:
+            return
+        projects_db.create_project(conn, name=project_id, slug=project_id)
+
+
 def _missing_constraint_rows(project: str, task_id: str):
     from hermes_cli.plugin_bridges import decision_hud as bridge
 
     db = bridge._load_decision_hud_db()
     conn = db.connect()
     try:
+        try:
+            proj = db._resolve_project(project)
+        except ValueError:
+            # Project never created (e.g. a test asserting the breaker
+            # never touches decision-hud at all below Rule 4's threshold) —
+            # by construction nothing could have been pushed against it.
+            return []
         rows = conn.execute(
-            "SELECT * FROM decisions WHERE project = ? AND card_type = 'missing_constraint' "
+            "SELECT * FROM decisions WHERE project_id = ? AND card_type = 'missing_constraint' "
             "AND json_extract(card_payload_json, '$.task_id') = ?",
-            (project, task_id),
+            (proj["id"], task_id),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -111,7 +131,7 @@ def _resolve_constraint(project: str, task_id: str, choice: str = "resolved"):
     db = bridge._load_decision_hud_db()
     conn = db.connect()
     try:
-        row = db.get_missing_constraint(conn, project=project, task_id=task_id)
+        row = db.get_missing_constraint(conn, project_id=project, task_id=task_id)
         assert row is not None, "test setup: missing_constraint row must exist before resolving"
         token = db.issue_actor_token("test-po")
         return db.resolve_decision(conn, row["id"], choice, actor_token=token)
@@ -138,6 +158,7 @@ def _fail_n_times(conn, task_id: str, n: int, *, failure_limit: int = 10):
 
 class TestRule4MissingConstraintEscalation:
     def _setup(self, project="proj-r4"):
+        _ensure_decision_hud_project(project)
         kb.create_board(project)
         with kbc.connect(board=project) as conn:
             task_id = kb.create_task(
