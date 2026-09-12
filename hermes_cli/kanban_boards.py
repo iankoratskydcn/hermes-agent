@@ -123,14 +123,40 @@ def _cmd_boards_switch(args: argparse.Namespace) -> int:
 
 
 def _cmd_boards_show(args: argparse.Namespace) -> int:
-    current = kb.get_current_board()
+    requested = getattr(args, "slug", None)
+    if requested:
+        normed, rc = _board_slug_arg(args, "show", must_exist=True)
+        if rc:
+            return rc
+        assert normed is not None
+        current = normed
+    else:
+        current = kb.get_current_board()
     meta = kb.read_board_metadata(current)
     counts = _board_task_counts(current)
+    if _json_out(args, {
+        "slug": current,
+        "name": meta.get("name", ""),
+        "description": meta.get("description"),
+        "db_path": meta["db_path"],
+        "counts": counts,
+        "total": sum(counts.values()),
+        "dispatch_enabled": meta.get("dispatch_enabled", True),
+        "auto_decompose_enabled": meta.get("auto_decompose_enabled", True),
+        "review_dispatch_enabled": meta.get("review_dispatch_enabled", True),
+    }):
+        return 0
     print(f"Current board: {current}\n  Display name: {meta.get('name', '')}")
     if meta.get("description"):
         print(f"  Description:  {meta['description']}")
     print(f"  DB path:      {meta['db_path']}\n"
           f"  Tasks:        {sum(counts.values())} total" + (f" ({_fmt_counts(counts)})" if counts else ""))
+    dispatch_word = "on" if meta.get("dispatch_enabled", True) else "off (board override)"
+    decompose_word = "on" if meta.get("auto_decompose_enabled", True) else "off (board override)"
+    review_word = "on" if meta.get("review_dispatch_enabled", True) else "off (board override)"
+    print(f"  Dispatch:     {dispatch_word}\n"
+          f"  Auto-decompose: {decompose_word}\n"
+          f"  Review-dispatch: {review_word}")
     return 0
 
 
@@ -152,6 +178,93 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
         print(f"Board {normed!r} default workdir set to {new_val!r}.")
     else:
         print(f"Board {normed!r} default workdir cleared.")
+    return 0
+
+
+def _cmd_boards_set_dispatch(args: argparse.Namespace) -> int:
+    normed, rc = _board_slug_arg(args, "set-dispatch", must_exist=True)
+    if rc:
+        return rc
+    enabled = args.state == "on"
+    meta = kb.write_board_metadata(normed, dispatch_enabled=enabled)
+    state_word = "enabled" if meta.get("dispatch_enabled", True) else "disabled"
+    print(f"Board {normed!r} dispatch {state_word}.")
+    if state_word == "disabled":
+        print("  Note: this only suppresses THIS board. The global dispatcher "
+              "switch (kanban.dispatch_in_gateway in config.yaml) still gates every board.")
+    return 0
+
+
+def _cmd_boards_set_auto_decompose(args: argparse.Namespace) -> int:
+    normed, rc = _board_slug_arg(args, "set-auto-decompose", must_exist=True)
+    if rc:
+        return rc
+    enabled = args.state == "on"
+    meta = kb.write_board_metadata(normed, auto_decompose_enabled=enabled)
+    state_word = "enabled" if meta.get("auto_decompose_enabled", True) else "disabled"
+    print(f"Board {normed!r} auto-decompose {state_word}.")
+    if state_word == "disabled":
+        print("  Note: this only suppresses THIS board. The global auto-decompose "
+              "switch (kanban.auto_decompose in config.yaml) still gates every board.")
+    return 0
+
+
+def _cmd_boards_set_review_dispatch(args: argparse.Namespace) -> int:
+    normed, rc = _board_slug_arg(args, "set-review-dispatch", must_exist=True)
+    if rc:
+        return rc
+    enabled = args.state == "on"
+    meta = kb.write_board_metadata(normed, review_dispatch_enabled=enabled)
+    state_word = "enabled" if meta.get("review_dispatch_enabled", True) else "disabled"
+    print(f"Board {normed!r} review-dispatch {state_word}.")
+    if state_word == "disabled":
+        print("  Note: this only suppresses THIS board. The global review-dispatch "
+              "switch (kanban.review_dispatch in config.yaml) still gates every board.")
+    return 0
+
+
+def _cmd_boards_set_batch_gate(args: argparse.Namespace) -> int:
+    """F1 (default-gated dispatch): wire/inspect/clear a board's
+    ``batch_approval_gate``. Dispatch refuses to run at all until this is
+    set to an APPROVED decision-hud batch; a passing check consumes it
+    (single-use), so this is expected to be re-run before every dispatch
+    cycle, not a one-time setup step.
+    """
+    normed, rc = _board_slug_arg(args, "set-batch-gate", must_exist=True)
+    if rc:
+        return rc
+    if args.clear:
+        meta = kb.write_board_metadata(normed, batch_approval_gate=None)
+        if _json_out(args, {"board": normed, "batch_approval_gate": meta.get("batch_approval_gate")}):
+            return 0
+        print(f"Board {normed!r} batch approval gate cleared — dispatch is now BLOCKED "
+              "for this board until a new gate is set.")
+        return 0
+    if not args.project and not args.batch_id:
+        # Inspect-only: no project/batch_id given, no --clear.
+        current = kb.read_board_metadata(normed).get("batch_approval_gate")
+        if _json_out(args, {"board": normed, "batch_approval_gate": current}):
+            return 0
+        if current:
+            print(f"Board {normed!r} batch approval gate: project={current.get('project')!r} "
+                  f"batch_id={current.get('batch_id')!r}")
+        else:
+            print(f"Board {normed!r} has no batch approval gate configured — "
+                  "dispatch is BLOCKED for this board (default-gated).")
+        return 0
+    if not args.project or not args.batch_id:
+        return _err("set-batch-gate: both project and batch_id are required together "
+                     "(or omit both to inspect, or pass --clear to remove)")
+    meta = kb.write_board_metadata(
+        normed, batch_approval_gate={"project": args.project, "batch_id": args.batch_id},
+    )
+    if _json_out(args, {"board": normed, "batch_approval_gate": meta.get("batch_approval_gate")}):
+        return 0
+    print(f"Board {normed!r} batch approval gate set to project={args.project!r} "
+          f"batch_id={args.batch_id!r}.\n"
+          "  Dispatch will proceed on the NEXT tick only if that batch is already "
+          "APPROVED in decision-hud (hermes decision check-batch), then the gate is "
+          "consumed automatically (cleared) — you must set it again for the next round.")
     return 0
 
 
@@ -209,6 +322,10 @@ _BOARD_HANDLERS = {
     "show": _cmd_boards_show, "current": _cmd_boards_show,
     "rename": _cmd_boards_rename,
     "set-default-workdir": _cmd_boards_set_default_workdir,
+    "set-dispatch": _cmd_boards_set_dispatch,
+    "set-auto-decompose": _cmd_boards_set_auto_decompose,
+    "set-review-dispatch": _cmd_boards_set_review_dispatch,
+    "set-batch-gate": _cmd_boards_set_batch_gate,
     "export": _cmd_boards_export,
     "import": _cmd_boards_import,
 }

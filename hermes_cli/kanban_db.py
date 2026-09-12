@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from toolsets import get_toolset_names
+from utils import atomic_write_text
 
 _log = logging.getLogger(__name__)
 
@@ -521,14 +522,75 @@ def board_metadata_path(board: Optional[str] = None) -> Path:
     return board_dir(_slug_or_default(board)) / "board.json"
 
 
+@contextlib.contextmanager
+def _board_metadata_lock(board_json_path: Path):
+    """Cross-process exclusive lock around a board.json read-modify-write cycle.
+
+    A sibling ``.board.json.lock`` file, ``fcntl.flock``-guarded — same shape
+    as ``kanban_db_connect._cross_process_init_lock``. Blocking (not
+    non-blocking/bounded like the init lock): a board.json write is a small,
+    fast, bounded critical section (no network/DB I/O), so a brief wait for a
+    concurrent writer is the correct trade — unlike the init lock, which
+    guards a potentially-slow first-connect path and must never wedge the
+    dispatcher's tick.
+    """
+    board_json_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = board_json_path.with_name(board_json_path.name + ".lock")
+    if _IS_WINDOWS:
+        import msvcrt
+
+        handle = lock_path.open("a+b")
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            handle.close()
+    else:
+        import fcntl
+
+        handle = lock_path.open("a+b")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def _default_board_display_name(slug: str) -> str:
     """``atm10-server`` -> ``Atm10 Server``."""
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
+_BOARD_SAFETY_TOGGLE_FIELDS = (
+    "dispatch_enabled",
+    "auto_decompose_enabled",
+    "review_dispatch_enabled",
+)
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """``board.json`` merged over defaults, plus ``slug`` and ``db_path``. Never
-    raises — a missing/malformed file yields the synthesized entry."""
+    raises — a missing/malformed file yields the synthesized entry.
+
+    A genuinely missing ``board.json`` (new/never-created board) is the
+    normal case and defaults every safety toggle to enabled (``True`` =
+    "inherit global", not "off"). A *present but corrupt/unparsable*
+    ``board.json`` is a different failure class: it means we cannot trust
+    what the operator last set, so the three safety-relevant toggle fields
+    (``dispatch_enabled`` / ``auto_decompose_enabled`` /
+    ``review_dispatch_enabled``) fail CLOSED (default to ``False``) instead
+    of silently re-enabling a board an operator may have deliberately
+    paused. A WARNING is logged with the board slug and the exception so
+    the corruption is visible, not silent.
+    """
     slug = _slug_or_default(board)
     meta: dict[str, Any] = {
         "slug": slug,
@@ -541,52 +603,131 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "project_id": None,
         "created_at": None,
         "archived": False,
+        # Per-board override of the corresponding global kanban.* dispatch
+        # switch. True (default) means "obey the global switch, no override"
+        # — same absent-key-is-safe-default shape as `archived`. A board's
+        # own flag is narrowing-only: it can suppress this board under an
+        # enabled global switch, but a disabled global switch always wins.
+        "dispatch_enabled": True,
+        "auto_decompose_enabled": True,
+        "review_dispatch_enabled": True,
+        # Decision HUD dispatch gate (F1, opt-in): a batch_id that must be
+        # resolved 'approve' via decision-hud's require_batch_approval()
+        # before this board's dispatch_once tick may claim/spawn any task.
+        # None (default, absent key) means "no gate configured" — existing
+        # boards are completely unaffected until an operator opts in.
+        "batch_approval_gate": None,
+        # Wave2/2c: deterministic atomic-task-gate/ears-sensibility-gate
+        # precheck at dispatch time (hermes_cli/kanban_gate_precheck.py).
+        # False (default, absent key) means "no precheck" — unlike the F1
+        # batch-approval gate above, this is opt-IN per board: a new,
+        # unproven heuristic with a materially different risk profile
+        # (false positives/negatives on the EARS-shape check), so existing
+        # and new boards alike stay unaffected until an operator explicitly
+        # turns it on.
+        "gate_precheck_enabled": False,
     }
+    p = board_metadata_path(slug)
+    file_exists = False
     try:
-        p = board_metadata_path(slug)
-        if p.exists():
+        file_exists = p.exists()
+    except OSError:
+        file_exists = False
+    if file_exists:
+        try:
             raw = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            # File exists but could not be parsed — corruption (e.g. a torn
+            # write), not "no board.json yet". Fail closed on the
+            # safety-relevant toggles rather than silently re-enabling
+            # dispatch/auto-decompose/review-dispatch on a board an
+            # operator may have paused.
+            _log.warning(
+                "board.json for board %r exists but failed to parse (%s: %s) — "
+                "failing CLOSED on dispatch_enabled/auto_decompose_enabled/"
+                "review_dispatch_enabled for this read rather than silently "
+                "re-enabling a possibly-paused board.",
+                slug, type(exc).__name__, exc,
+            )
+            for field in _BOARD_SAFETY_TOGGLE_FIELDS:
+                meta[field] = False
+        else:
             if isinstance(raw, dict):
                 # Never let the metadata file claim a different slug than
                 # its directory — trust the filesystem.
                 raw["slug"] = slug
                 meta.update(raw)
-    except (OSError, json.JSONDecodeError):
-        pass
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
+
+
+_UNSET = object()
 
 
 def write_board_metadata(
     board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
     icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
     default_workdir: Optional[str] = None, project_id: Optional[str] = None,
+    dispatch_enabled: Optional[bool] = None, auto_decompose_enabled: Optional[bool] = None,
+    review_dispatch_enabled: Optional[bool] = None, batch_approval_gate: Any = _UNSET,
+    gate_precheck_enabled: Optional[bool] = None,
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
     set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
-    "" = clear (``project_id`` is not validated here)."""
+    "" = clear (``project_id`` is not validated here). ``dispatch_enabled`` /
+    ``auto_decompose_enabled`` / ``review_dispatch_enabled`` / ``gate_precheck_enabled``:
+    ``None`` = unchanged (tri-state like ``archived``, not the string-clearing
+    convention above).
+    ``batch_approval_gate`` (F1): the default sentinel (omitted) = unchanged;
+    ``None`` explicitly clears the gate (dispatch proceeds ungated again);
+    ``{"project": ..., "batch_id": ...}`` sets/replaces it. Uses its own
+    sentinel (not ``None``) because ``None`` is itself a valid, meaningful
+    value here (clear the gate) — unlike the tri-state booleans above.
+    """
     _assert_not_delegated_child_mutation()
     slug = _slug_or_default(board)
-    meta = read_board_metadata(slug)
-    # db_path is derived on every read; never persist it into board.json.
-    meta.pop("db_path", None)
-    if name is not None:
-        meta["name"] = str(name).strip() or _default_board_display_name(slug)
-    for key, value in (("description", description), ("icon", icon), ("color", color)):
-        if value is not None:
-            meta[key] = str(value)
-    if archived is not None:
-        meta["archived"] = bool(archived)
-    for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
-        if value is not None:
-            meta[key] = str(value) if value else None
-    if not meta.get("created_at"):
-        meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
-    )
+    # Serialize the whole read-modify-write cycle per board so concurrent
+    # writers (CLI boards set-dispatch/set-auto-decompose/set-review-dispatch/
+    # rename, the dashboard's PATCH /boards/{slug}, kanban_transfer import,
+    # projects_cmd) cannot interleave and clobber each other's field changes
+    # (last-writer-wins on the WHOLE dict, not just the field each writer
+    # intended to change). Matches the style of
+    # ``kanban_db_connect._cross_process_init_lock``.
+    with _board_metadata_lock(path):
+        meta = read_board_metadata(slug)
+        # db_path is derived on every read; never persist it into board.json.
+        meta.pop("db_path", None)
+        if name is not None:
+            meta["name"] = str(name).strip() or _default_board_display_name(slug)
+        for key, value in (("description", description), ("icon", icon), ("color", color)):
+            if value is not None:
+                meta[key] = str(value)
+        if archived is not None:
+            meta["archived"] = bool(archived)
+        if dispatch_enabled is not None:
+            meta["dispatch_enabled"] = bool(dispatch_enabled)
+        if auto_decompose_enabled is not None:
+            meta["auto_decompose_enabled"] = bool(auto_decompose_enabled)
+        if review_dispatch_enabled is not None:
+            meta["review_dispatch_enabled"] = bool(review_dispatch_enabled)
+        if gate_precheck_enabled is not None:
+            meta["gate_precheck_enabled"] = bool(gate_precheck_enabled)
+        if batch_approval_gate is not _UNSET:
+            meta["batch_approval_gate"] = batch_approval_gate
+        for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
+            if value is not None:
+                meta[key] = str(value) if value else None
+        if not meta.get("created_at"):
+            meta["created_at"] = int(time.time())
+        # Atomic temp-file + fsync + os.replace: a crash/kill mid-write can
+        # never leave a truncated/corrupt board.json. Matches the shared
+        # ``utils.atomic_write_text`` pattern used elsewhere (active_sessions.py,
+        # copilot_auth.py, banner.py, ...).
+        atomic_write_text(
+            path, json.dumps(meta, indent=2, ensure_ascii=False) + "\n", tmp_prefix=".board_",
+        )
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
 
@@ -715,12 +856,22 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Wave2/1a schema-foundation fields (Rule 2/6 + atomic-task-gate precheck).
+    # Schema-only here: no dispatch/gate enforcement reads these yet.
+    task_mode: Optional[str] = None           # 'autocomplete' | 'chat' | 'agent'
+    ears_sentence: Optional[str] = None       # EARS-restated requirement (Rule 6)
+    oracle: Optional[str] = None              # named independent verification oracle
+    scope_paths: Optional[list] = None        # JSON-encoded list of allowed file paths
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         g = lambda col, default=None: _row_get(row, col, default)  # noqa: E731
         parsed = _json_or(g("skills"))
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
+        scope_parsed = _json_or(g("scope_paths"))
+        scope_paths_value = (
+            [str(p) for p in scope_parsed if p] if isinstance(scope_parsed, list) else None
+        )
         return cls(
             **{col: row[col] for col in _TASK_REQUIRED_COLUMNS},
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
@@ -732,6 +883,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            scope_paths=scope_paths_value,
         )
 
 
@@ -745,6 +897,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "task_mode", "ears_sentence", "oracle",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -941,7 +1094,18 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Wave2/1a schema-foundation columns. Schema-only: not yet consulted by
+    -- dispatch/gate enforcement (a separate downstream wave wires them in).
+    -- Rule 2 verification-rigor classification: 'autocomplete'|'chat'|'agent'.
+    task_mode            TEXT,
+    -- Rule 6 EARS-restated requirement for this task.
+    ears_sentence         TEXT,
+    -- Named independent verification oracle for this task.
+    oracle                TEXT,
+    -- JSON-encoded list of file paths this task may touch (atomic-task-gate
+    -- precheck input). NULL = unset; matches the ``skills`` None-vs-[] shape.
+    scope_paths           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1115,10 +1279,41 @@ def _resolve_project_link(
             project_obj = _pdb.get_project(_pconn, project_id)
     except Exception:
         project_obj = None
-    if project_obj is None and project_source_task_id:
-        project_obj, project_repo = _project_from_source_task(
-            conn, _pdb, project_id, str(project_source_task_id),
-        )
+    if project_obj is None:
+        source_task_id = project_source_task_id
+        if not source_task_id:
+            source_row = conn.execute(
+                "SELECT id FROM tasks "
+                "WHERE project_id = ? AND workspace_kind = 'worktree' "
+                "  AND workspace_path IS NOT NULL "
+                "ORDER BY created_at ASC, id ASC LIMIT 1",
+                (project_id,),
+            ).fetchone()
+            source_task_id = source_row["id"] if source_row else None
+        if source_task_id:
+            project_obj, project_repo = _project_from_source_task(
+                conn, _pdb, project_id, str(source_task_id),
+            )
+            if project_obj is None:
+                # Worker profiles have independent projects.db files. If the
+                # registry lookup and branch-derived slug recovery both fail,
+                # retain the project link from a canonical absolute worktree
+                # task rather than silently degrading to an unlinked child.
+                source_task = get_task(conn, str(source_task_id))
+                source_path = Path(source_task.workspace_path) if source_task and source_task.workspace_path else None
+                if (
+                    source_path is not None
+                    and source_path.is_absolute()
+                    and source_path.parent.name == ".worktrees"
+                ):
+                    project_repo = str(source_path.parent.parent)
+                    project_obj = _pdb.Project(
+                        id=project_id,
+                        slug=project_id,
+                        name=project_id,
+                        created_at=0,
+                        primary_path=project_repo,
+                    )
         if project_obj is not None and workspace_kind == "scratch":
             workspace_kind = "worktree"
     if project_obj is None:
@@ -1218,6 +1413,25 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def _normalize_scope_paths(scope_paths: Optional[Iterable[str]]) -> Optional[list[str]]:
+    """Strip/dedupe a scope_paths list (relative file paths the atomic-task-gate
+    precheck will validate a task against). Mirrors ``_normalize_task_skills``'s
+    None-vs-[] semantics: None = unset, [] = explicitly empty."""
+    if scope_paths is None:
+        return None
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for p in scope_paths:
+        if not p:
+            continue
+        path = str(p).strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        cleaned.append(path)
+    return cleaned
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1232,6 +1446,10 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    task_mode: Optional[str] = None,
+    ears_sentence: Optional[str] = None,
+    oracle: Optional[str] = None,
+    scope_paths: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1247,6 +1465,10 @@ def create_task(
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+    ``task_mode``/``ears_sentence``/``oracle``/``scope_paths``: Wave2/1a
+    schema-foundation fields (Rule 2/6 verification-rigor classification, EARS
+    restatement, named oracle, atomic-task-gate scope). Schema-only here — NULL
+    when unset; not consulted by dispatch/gate enforcement yet.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
@@ -1285,6 +1507,7 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    scope_paths_list = _normalize_scope_paths(scope_paths)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1331,8 +1554,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        task_mode, ears_sentence, oracle, scope_paths
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1342,6 +1566,8 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        task_mode, ears_sentence, oracle,
+                        json.dumps(scope_paths_list) if scope_paths_list is not None else None,
                     ),
                 )
                 for pid in parents:
@@ -3178,20 +3404,30 @@ def request_changes(
 
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
-    dry_run: bool = False,
+    dry_run: bool = False, readiness: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished; ``dry_run`` only validates.
-    Returns ``(ok, reason)``."""
+    """Operator promotion to ``ready`` with an audit event.
+
+    Normal promotion accepts ``todo``/``blocked``. ``readiness=True`` is the
+    explicit triage escape hatch for inspection-only canaries; it requires an
+    audit reason and never changes the normal promotion semantics. Parent
+    dependencies are never bypassable (#106195): ``claim_task`` demotes
+    ``ready`` -> ``todo`` on an undone parent regardless of who set ``ready``,
+    so a forced promotion would only report a success the first claim
+    silently reverts.
+    """
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
 
-    if cur_status not in ("todo", "blocked"):
+    allowed_statuses = ("triage",) if readiness else ("todo", "blocked")
+    if cur_status not in allowed_statuses:
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            + ("'triage' in readiness mode" if readiness else "'todo' or 'blocked'")
         )
+    if readiness and not (reason or "").strip():
+        return False, "readiness promotion requires a non-empty audit reason"
 
     # No override: claim_task demotes ready -> todo on an undone parent whichever
     # writer set 'ready', so a forced promotion would only report a success the
@@ -3214,13 +3450,18 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        allowed_sql_statuses = "'triage'" if readiness else "'todo', 'blocked'"
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
+            f"WHERE id = ? AND status IN ({allowed_sql_statuses})",
+            (task_id,),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
-        _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
+        _append_event(
+            conn, task_id, "promoted_readiness" if readiness else "promoted_manual",
+            {"actor": actor, "reason": reason, "readiness": readiness},
+        )
 
     return True, None
 
@@ -3433,10 +3674,15 @@ def invalidate_descendants_for_parent_reopen(
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+    task_mode: Optional[str] = None, ears_sentence: Optional[str] = None,
 ) -> bool:
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
     gating still applies; the audit comment is written only when a field changed.
+
+    ``task_mode``/``ears_sentence``: Wave2/1a schema-foundation fields (Rule 2/6).
+    Unset (``None``) leaves the column untouched — callers that don't classify
+    a task keep existing/NULL behaviour.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
@@ -3463,6 +3709,12 @@ def specify_triage_task(
             sets.append("assignee = ?")
             params.append(assignee)
             changed_fields.append("assignee")
+        if task_mode is not None:
+            sets.append("task_mode = ?")
+            params.append(task_mode)
+        if ears_sentence is not None:
+            sets.append("ears_sentence = ?")
+            params.append(ears_sentence)
         params.append(task_id)
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
@@ -3485,6 +3737,203 @@ def specify_triage_task(
     # flips to 'ready' now instead of idling until the next tick.
     recompute_ready(conn)
     return True
+
+
+def _validate_children_graph(children: list) -> None:
+    """DB-free shape check + Kahn's cycle check on the sibling graph (a cycle
+    would deadlock every involved child in ``todo`` forever)."""
+    for idx, child in enumerate(children):
+        if not isinstance(child, dict):
+            raise ValueError(f"child[{idx}] is not a dict")
+        title = child.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError(f"child[{idx}].title is required")
+        parents_idx = child.get("parents") or []
+        if not isinstance(parents_idx, list):
+            raise ValueError(f"child[{idx}].parents must be a list")
+        for p in parents_idx:
+            if not isinstance(p, int) or p < 0 or p >= len(children):
+                raise ValueError(f"child[{idx}].parents[{p}] is not a valid index into children")
+            if p == idx:
+                raise ValueError(f"child[{idx}] cannot list itself as a parent")
+
+    in_deg = [0] * len(children)
+    adj: list[list[int]] = [[] for _ in children]
+    for i, c in enumerate(children):
+        for p in (c.get("parents") or []):
+            adj[p].append(i)
+            in_deg[i] += 1
+    queue = [i for i in range(len(children)) if in_deg[i] == 0]
+    seen = 0
+    while queue:
+        seen += 1
+        for nb in adj[queue.pop()]:
+            in_deg[nb] -= 1
+            if in_deg[nb] == 0:
+                queue.append(nb)
+    if seen != len(children):
+        raise ValueError("cyclic dependency detected in decomposed children list")
+
+
+def decompose_triage_task(
+    conn: sqlite3.Connection, task_id: str, *, root_assignee: Optional[str], children: list[dict],
+    author: Optional[str] = None, auto_promote: bool = True,
+) -> Optional[list[str]]:
+    """Fan a triage task out into children and move the root to ``todo``; the root
+    waits on every child and wakes (``ready``) when all are done.
+
+    ``children``: dicts of ``title`` (required), ``body``, ``assignee``,
+    ``parents`` (indices into this list), optional workspace overrides.
+    Returns child ids in input order, or None when the root is missing, not
+    in triage, or has already decomposed. Atomic: a malformed entry aborts
+    the whole fan-out.
+    """
+    if not children:
+        return None
+    if root_assignee is not None:
+        root_assignee = _canonical_assignee(root_assignee)
+    _validate_children_graph(children)
+
+    # ONE txn so the fan-out is atomic; helpers that open their own write_txn
+    # (create_task, link_tasks, add_comment) must not be called in here.
+    now = int(time.time())
+    with write_txn(conn):
+        root_row = conn.execute(
+            "SELECT id, status, priority, tenant, workspace_kind, workspace_path, "
+            "project_id, skills, max_runtime_seconds, max_retries, "
+            "model_override, provider_override, reasoning_effort, goal_mode, "
+            "goal_max_turns, session_id "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if root_row is None or root_row["status"] != "triage":
+            return None
+        # Dependency links alone do not imply lineage. The completion event is
+        # committed with the graph, and survives re-triage or unlinking, so
+        # even a retriaged root cannot be silently re-fanned-out into a
+        # duplicate child graph.
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decomposed' LIMIT 1",
+            (task_id,),
+        ).fetchone():
+            return None
+        child_ids = [
+            _insert_decomposed_child(conn, task_id, root_row, child, idx, author, now)
+            for idx, child in enumerate(children)
+        ]
+        # Sibling edges within the decomposed graph.
+        for idx, child in enumerate(children):
+            for p_idx in child.get("parents") or []:
+                parent_id, child_id = child_ids[p_idx], child_ids[idx]
+                _link(conn, parent_id, child_id)
+                _append_event(conn, child_id, "linked", {"parent": parent_id, "child": child_id})
+        # Root waits for the whole graph: link it under EVERY child (simpler
+        # than computing leaves; cycle-free since the root is only ever a child).
+        for cid in child_ids:
+            _link(conn, cid, task_id)
+        # Flip the root triage -> todo, assignee -> orchestrator.
+        sets = ["status = 'todo'"]
+        params: list[Any] = []
+        if root_assignee is not None:
+            sets.append("assignee = ?")
+            params.append(root_assignee)
+        params.append(task_id)
+        conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", tuple(params))
+        if author and author.strip():
+            _insert_comment(
+                conn, task_id, author.strip(),
+                "Decomposed into " + ", ".join(child_ids)
+                + ". Root will wake when all children complete.",
+                now,
+            )
+        _append_event(
+            conn, task_id, "decomposed", {"child_ids": child_ids, "root_assignee": root_assignee},
+        )
+    # Outside the txn (own IMMEDIATE txn). ``auto_promote=False`` leaves the
+    # children in ``todo`` for manual-review-first workflows.
+    if auto_promote:
+        recompute_ready(conn)
+    return child_ids
+
+
+def _insert_decomposed_child(
+    conn: sqlite3.Connection, root_id: str, root_row: sqlite3.Row, child: dict,
+    child_index: int, author: Optional[str], now: int,
+) -> str:
+    """Insert one decomposed child as ``todo`` (linked under the root later so
+    the dispatcher only ever sees a coherent graph); returns its id.
+
+    Project, skills, workspace, branch, and idempotency metadata are derived
+    from the root without sharing sibling worktrees or branches. This keeps
+    the atomic fan-out path equivalent to ``create_task`` for execution
+    envelope fields while avoiding nested write transactions.
+    """
+    root_ws_kind = root_row["workspace_kind"] or "scratch"
+    child_ws_kind = child.get("workspace_kind") or root_ws_kind
+    new_id = _new_task_id()
+    child_ws_path = child.get("workspace_path")
+    project_id = root_row["project_id"]
+    project_id, project_obj, project_repo, child_ws_kind = _resolve_project_link(
+        conn, project_id, root_id, child_ws_kind, child_ws_path,
+    )
+    if project_id and project_obj is not None and child_ws_kind == "worktree":
+        if not child_ws_path:
+            child_ws_path = os.path.join(project_repo or str(project_obj.primary_path), ".worktrees", new_id)
+        branch_name = _project_branch_name(project_obj, new_id, child.get("title"))
+        branch_name = branch_name or f"{project_id}/{new_id}"
+    elif child_ws_kind == "worktree":
+        root_path = root_row["workspace_path"]
+        if not child_ws_path and root_path:
+            root_path_obj = Path(str(root_path))
+            if root_path_obj.is_absolute() and root_path_obj.parent.name == ".worktrees":
+                child_ws_path = str(root_path_obj.parent.parent / ".worktrees" / new_id)
+        branch_name = f"wt/{new_id}"
+    else:
+        branch_name = None
+    if child_ws_kind == "worktree" and not child_ws_path:
+        raise ValueError(f"decomposed child {new_id} has no resolvable absolute worktree")
+    if child_ws_path and not os.path.isabs(str(child_ws_path)):
+        raise ValueError(f"decomposed child {new_id} worktree must be absolute")
+    try:
+        root_skills = json.loads(root_row["skills"]) if root_row["skills"] else None
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"root {root_id} has invalid skills metadata") from exc
+    skills = _normalize_task_skills(root_skills)
+    idempotency_key = f"decompose:{root_id}:{child_index}"
+    body = child.get("body")
+    task_mode = child.get("task_mode")
+    ears_sentence = child.get("ears_sentence")
+    conn.execute(
+        "INSERT INTO tasks "
+        "(id, title, body, assignee, status, priority, workspace_kind, "
+        " workspace_path, branch_name, project_id, tenant, idempotency_key, "
+        " max_runtime_seconds, skills, max_retries, model_override, "
+        " provider_override, reasoning_effort, goal_mode, goal_max_turns, "
+        " session_id, created_at, created_by, task_mode, ears_sentence) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            new_id, child["title"].strip(), body if isinstance(body, str) else None,
+            _canonical_assignee(child.get("assignee")), root_row["priority"], child_ws_kind,
+            child_ws_path, branch_name, project_id, root_row["tenant"], idempotency_key,
+            root_row["max_runtime_seconds"],
+            json.dumps(skills) if skills is not None else None,
+            root_row["max_retries"], root_row["model_override"],
+            root_row["provider_override"], root_row["reasoning_effort"],
+            root_row["goal_mode"], root_row["goal_max_turns"], root_row["session_id"],
+            now, (author or "decomposer"),
+            task_mode if isinstance(task_mode, str) and task_mode else None,
+            ears_sentence if isinstance(ears_sentence, str) and ears_sentence else None,
+        ),
+    )
+    _append_event(
+        conn, new_id, "created", {
+            "by": author or "decomposer", "from_decompose_of": root_id,
+            "workspace_kind": child_ws_kind, "workspace_path": child_ws_path,
+            "branch_name": branch_name, "project_id": project_id,
+            "skills": skills, "idempotency_key": idempotency_key,
+        },
+    )
+    _inherit_notify_subs(conn, new_id, (root_id,), created_at=now)
+    return new_id
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -4119,6 +4568,7 @@ _PLUGIN_COMPAT_LAZY = {
     'rewind_notify_cursor': ('hermes_cli.kanban_db_notify', 'rewind_notify_cursor'),
     'run_daemon': ('hermes_cli.kanban_db_dispatch', 'run_daemon'),
     'set_branch_name': ('hermes_cli.kanban_db_workspace', 'set_branch_name'),
+    'set_project_id': ('hermes_cli.kanban_db_workspace', 'set_project_id'),
     'set_workspace_path': ('hermes_cli.kanban_db_workspace', 'set_workspace_path'),
     'unseen_events_for_sub': ('hermes_cli.kanban_db_notify', 'unseen_events_for_sub'),
     'worker_log_rotation_config': ('hermes_cli.kanban_db_dispatch', 'worker_log_rotation_config'),

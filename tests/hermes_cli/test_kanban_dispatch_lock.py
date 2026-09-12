@@ -31,6 +31,11 @@ def kanban_home(tmp_path, monkeypatch):
     db_path = kb.kanban_db_path(board="default")
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     kb.init_db()
+    # F1 (default-gated dispatch): every board requires an APPROVED
+    # decision-hud batch_approval_gate before dispatch_once() will
+    # claim/spawn anything. This suite predates F1 and tests the
+    # single-writer lock specifically — bypass the orthogonal gate.
+    monkeypatch.setattr(kbd, "batch_approval_gate_ok", lambda board=None: (True, "test-bypass"))
     return home
 
 

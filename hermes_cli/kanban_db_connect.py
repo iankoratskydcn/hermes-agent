@@ -813,6 +813,11 @@ _LATER_TASK_COLUMNS = (
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
+    # Wave2/1a schema-foundation columns (see SCHEMA_SQL comment in kanban_db.py).
+    ("task_mode", "task_mode TEXT"),
+    ("ears_sentence", "ears_sentence TEXT"),
+    ("oracle", "oracle TEXT"),
+    ("scope_paths", "scope_paths TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

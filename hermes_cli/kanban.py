@@ -222,7 +222,8 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "create", "new", "rm", "remove", "delete", "switch", "use", "rename",
-    "set-default-workdir", "import",
+    "set-default-workdir", "set-dispatch", "set-auto-decompose", "set-review-dispatch",
+    "set-batch-gate", "import",
 })
 
 
@@ -1019,8 +1020,12 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     results: list[dict[str, object]] = []
     with kbc.connect_closing() as conn:
         for tid in ids:
-            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, dry_run=dry_run)
+            ok, err = kb.promote_task(
+                conn, tid, actor=author, reason=reason, dry_run=dry_run,
+                readiness=bool(getattr(args, "readiness", False)),
+            )
             results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run,
+                            "readiness": bool(getattr(args, "readiness", False)),
                             "reason": reason, "error": err})
 
     failed = [r for r in results if not r["promoted"]]
