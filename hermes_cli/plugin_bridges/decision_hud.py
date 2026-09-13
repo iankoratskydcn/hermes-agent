@@ -17,13 +17,22 @@ point to keep in sync with decision-hud's schema.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
+import logging
+import os
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
 _MODULE_CACHE_KEY = "_hermes_decision_hud_db_bridge"
+# v6 is the first schema with the project_id contract used by this bridge.
+_MIN_DECISION_HUD_SCHEMA_VERSION = 6
+_REVISION_RECORD_NAME = "decision_hud_bridge_revision.json"
+_LOG = logging.getLogger(__name__)
 
 
 def _decision_hud_db_path() -> Path:
@@ -31,10 +40,77 @@ def _decision_hud_db_path() -> Path:
     return get_hermes_home() / "plugins" / "decision-hud" / "db.py"
 
 
+def _revision_record_path() -> Path:
+    """Return the profile-scoped, operator-local TOFU record path."""
+    from hermes_constants import get_hermes_home
+
+    return Path(get_hermes_home()) / "decision_hud" / _REVISION_RECORD_NAME
+
+
+def _atomic_write_revision_record(path: Path, record: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _observe_plugin_revision(db_path: Path) -> None:
+    """Record the first source hash; warn, but never block, on later changes."""
+    digest = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    record_path = _revision_record_path()
+    previous: Optional[dict[str, object]] = None
+    try:
+        previous = json.loads(record_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        pass
+    except (OSError, json.JSONDecodeError) as exc:
+        _LOG.warning("Decision HUD revision record unreadable (%s); replacing it", exc)
+    if isinstance(previous, dict) and previous.get("sha256") not in (None, digest):
+        _LOG.warning(
+            "Decision HUD plugin source hash changed: %s -> %s (%s)",
+            previous.get("sha256"), digest, db_path,
+        )
+    _atomic_write_revision_record(
+        record_path,
+        {"path": str(db_path), "sha256": digest},
+    )
+
+
+def _assert_supported_schema(module: object) -> None:
+    """Reject a plugin whose live SQLite schema is too old, before migration."""
+    try:
+        database_path = Path(module.db_path())  # type: ignore[attr-defined]
+    except Exception as exc:
+        raise ImportError(f"decision-hud database path unavailable: {exc}") from exc
+    if not database_path.exists() or database_path.stat().st_size == 0:
+        # Fresh installs are initialized by the plugin's normal connect() path.
+        return
+    conn = sqlite3.connect(str(database_path))
+    try:
+        row = conn.execute("PRAGMA user_version").fetchone()
+        version = int(row[0]) if row else 0
+    finally:
+        conn.close()
+    if version < _MIN_DECISION_HUD_SCHEMA_VERSION:
+        raise ImportError(
+            "decision-hud schema too old: "
+            f"{version}; bridge requires >= {_MIN_DECISION_HUD_SCHEMA_VERSION}"
+        )
+
+
 def _load_decision_hud_db():
-    """Import decision-hud's ``db.py`` by absolute path, cached in
-    ``sys.modules`` under a private key so repeated calls in one process
-    (every dispatch tick) don't re-parse the file."""
+    """Import and validate the cached standalone decision-hud ``db.py``."""
     cached = sys.modules.get(_MODULE_CACHE_KEY)
     if cached is not None:
         return cached
@@ -48,8 +124,10 @@ def _load_decision_hud_db():
     sys.modules[_MODULE_CACHE_KEY] = module
     try:
         spec.loader.exec_module(module)
+        _assert_supported_schema(module)
+        _observe_plugin_revision(db_path)
     except Exception:
-        # Don't cache a half-initialised module on failure.
+        # Don't cache a half-initialised or incompatible module on failure.
         sys.modules.pop(_MODULE_CACHE_KEY, None)
         raise
     return module
