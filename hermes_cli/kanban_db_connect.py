@@ -183,15 +183,13 @@ def _dispatch_tick_lock(db_path: Path):
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         handle = lock_path.open("a+b")
-        try:
-            acquired = _try_lock_nb(handle)
-        except (OSError, AttributeError):
-            acquired = False
-    except OSError:
-        # Can't even open the lock file (permissions, read-only FS): degrade to
-        # a no-op so a probe failure never blocks dispatch.
-        acquired = True
-        handle = None
+        # A lock setup error is not contention: callers must fail closed rather
+        # than run an unguarded write tick.
+        acquired = _try_lock_nb(handle)
+    except Exception:
+        if handle is not None:
+            handle.close()
+        raise
     try:
         yield acquired
     finally:

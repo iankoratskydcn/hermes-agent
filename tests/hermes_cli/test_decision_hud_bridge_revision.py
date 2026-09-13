@@ -77,7 +77,9 @@ def test_hash_change_logs_but_does_not_block_reload(staged_plugin, caplog):
     first_hash = json.loads(record.read_text(encoding="utf-8"))["sha256"]
 
     _write_plugin(plugin, bridge._MIN_DECISION_HUD_SCHEMA_VERSION, marker="second")
-    sys.modules.pop(bridge._MODULE_CACHE_KEY, None)
+    for key in list(sys.modules):
+        if key == bridge._MODULE_CACHE_KEY or key.startswith(f"{bridge._MODULE_CACHE_KEY}:"):
+            sys.modules.pop(key, None)
     with caplog.at_level(logging.WARNING, logger=bridge.__name__):
         module = bridge._load_decision_hud_db()
 

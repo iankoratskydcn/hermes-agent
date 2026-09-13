@@ -671,6 +671,7 @@ def write_board_metadata(
     dispatch_enabled: Optional[bool] = None, auto_decompose_enabled: Optional[bool] = None,
     review_dispatch_enabled: Optional[bool] = None, batch_approval_gate: Any = _UNSET,
     gate_precheck_enabled: Optional[bool] = None,
+    _expected_batch_approval_gate: Any = _UNSET,
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
     set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
@@ -697,6 +698,14 @@ def write_board_metadata(
     # ``kanban_db_connect._cross_process_init_lock``.
     with _board_metadata_lock(path):
         meta = read_board_metadata(slug)
+        # A single-use approval must be compare-and-consumed under the same
+        # board metadata lock as this read-modify-write cycle. Never clear a
+        # replacement gate that arrived after the approval check.
+        if (
+            _expected_batch_approval_gate is not _UNSET
+            and meta.get("batch_approval_gate") != _expected_batch_approval_gate
+        ):
+            raise RuntimeError("batch approval gate changed before consumption")
         # db_path is derived on every read; never persist it into board.json.
         meta.pop("db_path", None)
         if name is not None:

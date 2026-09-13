@@ -109,26 +109,44 @@ def _assert_supported_schema(module: object) -> None:
         )
 
 
+def _source_digest(db_path: Path) -> str:
+    """Hash the source so an in-place replacement cannot reuse stale code."""
+    return hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+
 def _load_decision_hud_db():
-    """Import and validate the cached standalone decision-hud ``db.py``."""
-    cached = sys.modules.get(_MODULE_CACHE_KEY)
-    if cached is not None:
-        return cached
-    db_path = _decision_hud_db_path()
+    """Import and validate the profile-scoped standalone ``db.py``."""
+    db_path = _decision_hud_db_path().expanduser().resolve()
     if not db_path.is_file():
         raise ImportError(f"decision-hud not installed: {db_path} not found")
-    spec = importlib.util.spec_from_file_location(_MODULE_CACHE_KEY, db_path)
+    module_cache_key = f"{_MODULE_CACHE_KEY}:{db_path}"
+    cached = sys.modules.get(module_cache_key)
+    digest = _source_digest(db_path)
+    if cached is not None:
+        # Validate both identity and current source before using a cached module.
+        # The file may have been atomically replaced in place while this process
+        # remained alive; schema validation alone cannot detect stale code.
+        if (
+            getattr(cached, "__hermes_decision_hud_path__", None) == str(db_path)
+            and getattr(cached, "__hermes_decision_hud_digest__", None) == digest
+        ):
+            _assert_supported_schema(cached)
+            return cached
+        sys.modules.pop(module_cache_key, None)
+    spec = importlib.util.spec_from_file_location(module_cache_key, db_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"could not load decision-hud db module from {db_path}")
     module = importlib.util.module_from_spec(spec)
-    sys.modules[_MODULE_CACHE_KEY] = module
+    setattr(module, "__hermes_decision_hud_path__", str(db_path))
+    setattr(module, "__hermes_decision_hud_digest__", digest)
+    sys.modules[module_cache_key] = module
     try:
         spec.loader.exec_module(module)
         _assert_supported_schema(module)
         _observe_plugin_revision(db_path)
     except Exception:
         # Don't cache a half-initialised or incompatible module on failure.
-        sys.modules.pop(_MODULE_CACHE_KEY, None)
+        sys.modules.pop(module_cache_key, None)
         raise
     return module
 

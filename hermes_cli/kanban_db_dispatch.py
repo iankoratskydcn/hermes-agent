@@ -1672,66 +1672,25 @@ def dispatch_once(
     sweep (``gateway/kanban_watchers_dispatcher.py``), and the standalone
     ``run_daemon`` loop below — all call ``dispatch_once``; nothing outside
     this module (and its tests) calls ``_dispatch_once_locked`` directly.
-    Gating here, before the lock is even taken, means no caller can bypass
-    it by skipping a wrapper: both checks run FIRST, unconditionally, and a
-    read/parse failure on either fails CLOSED (refuses to dispatch), never
-    open. board=None (the legacy no-board caller) skips the board-level gate
-    (there is no board to gate) but a global config value can still refuse
-    to run below.
+    Gating and single-use approval consumption happen only after this call owns
+    the canonical dispatch lock, so a lock loser performs no gate reads or
+    writes. A path or lock setup failure fails closed with ``gate_blocked``;
+    it never falls through to an unguarded tick. board=None resolves through
+    the same canonical path/board machinery used by the lock.
     """
-    if not _board_dispatch_gate_ok(board):
-        result = DispatchResult(gate_blocked="board_dispatch_disabled")
+    def _blocked(reason: str) -> DispatchResult:
+        result = DispatchResult(gate_blocked=reason)
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
-    batch_ok, batch_reason = batch_approval_gate_ok(board)
-    if not batch_ok:
-        _kb._log.warning(
-            "kanban dispatch: board %r blocked by decision-hud batch approval gate: %s",
-            board, batch_reason,
-        )
-        result = DispatchResult(gate_blocked="batch_approval_required")
-        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
-        return result
-    # The gate passed for THIS tick. Per owner decision, an approval is
-    # single-use: it authorizes one dispatch cycle, not indefinite future
-    # dispatch, matching the original "PO approves this batch of tasks"
-    # intent. Consume it now (clear board.json's batch_approval_gate) —
-    # unconditionally, not deferred until after the locked tick — so a
-    # concurrent resolve/inspect of board.json can never observe a
-    # "gate still set but already spent" state, and so the consumption
-    # can't be skipped by an exception during the tick itself. dry_run
-    # ticks do NOT consume the gate (no real dispatch happened); a
-    # skipped_locked tick (another dispatcher won the lock) also must not
-    # consume it here, since THIS process never actually used the
-    # approval — deferred to right before the lock attempt so we still
-    # know whether we're a dry run, but before we know if we'll win the
-    # lock, is deliberately impossible to get race-free without holding
-    # the board lock too, so instead we scope consumption to "this call
-    # passed the gate and is not a dry run", accepting that a lock-losing
-    # dry-run-false tick still consumes the gate even though it didn't
-    # spawn anything this instant — the alternative (deferring past the
-    # lock) reintroduces a window where two callers can both read
-    # "approved" and both proceed to spawn before either clears it.
-    _gate_board = _resolve_gate_board(board)
-    if not dry_run and _gate_board is not None:
-        try:
-            _kb.write_board_metadata(_gate_board, batch_approval_gate=None)
-        except Exception:
-            # Consumption failing must not un-gate future ticks by
-            # accident, but it also must not silently re-arm the gate —
-            # log loudly; the NEXT tick will re-check batch_approval_gate_ok
-            # and, since we could not clear it, will see it still set and
-            # ask decision-hud again (this batch is likely still APPROVED,
-            # so the next tick would pass too — not a security hole, just
-            # means the "one approval, one cycle" contract slipped by one
-            # extra tick on a write failure, which is logged for the
-            # operator to notice).
-            _kb._log.warning(
-                "kanban dispatch: board %r batch approval gate could not be "
-                "cleared after a passing check — the approval may authorize "
-                "an extra dispatch tick beyond the intended single use",
-                _gate_board,
-            )
+
+    # Resolve the canonical lock path before defining/executing the tick. A
+    # path-resolution failure means there is no safe way to prove single-writer
+    # ownership, so fail closed and never run the tick unguarded.
+    try:
+        db_path = _kb.kanban_db_path(board=board)
+    except Exception as exc:
+        _kb._log.warning("kanban dispatch: cannot resolve dispatch DB path: %s", exc)
+        return _blocked("dispatch_setup_failed")
 
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
@@ -1749,20 +1708,69 @@ def dispatch_once(
             reconcile_orphans=reconcile_orphans,
         )
 
+    lock_cm = _kbc._dispatch_tick_lock(db_path)
     try:
-        db_path = _kb.kanban_db_path(board=board)
-    except Exception:
-        # Must not lose the tick — fall through to an unguarded dispatch.
-        result = _locked_tick()
-        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
-        return result
-    with _kbc._dispatch_tick_lock(db_path) as held:
+        held = lock_cm.__enter__()
+    except Exception as exc:
+        _kb._log.warning("kanban dispatch: dispatch-lock setup failed: %s", exc)
+        return _blocked("dispatch_setup_failed")
+    try:
         if not held:
             result = DispatchResult(skipped_locked=True)
         else:
-            result = _locked_tick()
-            # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
-            _kbc._maybe_checkpoint_wal(conn, db_path)
+            # Capture the gate before approval inspection. Consumption later
+            # compares this exact snapshot under the board metadata lock, so a
+            # replacement cannot be mistaken for the approved batch.
+            gate_board = _resolve_gate_board(board)
+            expected_gate = None
+            if gate_board is not None:
+                try:
+                    expected_gate = _kb.read_board_metadata(gate_board).get("batch_approval_gate")
+                except Exception:
+                    expected_gate = None
+            if not _board_dispatch_gate_ok(board):
+                result = DispatchResult(gate_blocked="board_dispatch_disabled")
+            else:
+                batch_ok, batch_reason = batch_approval_gate_ok(board)
+                if not batch_ok:
+                    _kb._log.warning(
+                        "kanban dispatch: board %r blocked by decision-hud batch approval gate: %s",
+                        board, batch_reason,
+                    )
+                    result = DispatchResult(gate_blocked="batch_approval_required")
+                elif dry_run:
+                    # Dry-run is an observation only. In particular, do not
+                    # reclaim, enforce timeouts, claim, spawn, checkpoint, or
+                    # consume the single-use approval.
+                    result = DispatchResult()
+                elif gate_board is not None:
+                    try:
+                        _kb.write_board_metadata(
+                            gate_board,
+                            batch_approval_gate=None,
+                            _expected_batch_approval_gate=expected_gate,
+                        )
+                    except Exception as exc:
+                        # Do not dispatch with an approval whose compare-and-
+                        # consume was not durable.
+                        _kb._log.warning(
+                            "kanban dispatch: failed closed while consuming batch approval for %r: %s",
+                            gate_board, exc,
+                        )
+                        result = DispatchResult(
+                            gate_blocked="batch_approval_consumption_failed"
+                        )
+                    else:
+                        result = _locked_tick()
+                else:
+                    result = _locked_tick()
+            # Checkpoint only real, lock-owning ticks; dry-runs are state no-ops.
+            if not dry_run:
+                _kbc._maybe_checkpoint_wal(conn, db_path)
+    finally:
+        # Exceptions from the dispatch body must retain their real traceback;
+        # only __enter__ failures above are lock-setup failures.
+        lock_cm.__exit__(None, None, None)
     # Lock released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
