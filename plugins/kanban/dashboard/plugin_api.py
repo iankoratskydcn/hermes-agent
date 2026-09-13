@@ -47,14 +47,12 @@ _BOARD_Q = Query(None, description="Kanban board slug (omit for current)")
 # --- Connection / board helpers ---------------------------------------------
 
 def _ws_upgrade_authorized(ws: "WebSocket") -> bool:
-    """Authorize a WS upgrade via the dashboard's canonical gate (``web_server_chat._ws_auth_ok``:
-    ``?token=`` / ``?ticket=`` / ``?internal=``) so this endpoint can never drift from core
-    auth; accepts when the dashboard isn't importable (bare-FastAPI test harness)."""
+    """Authorize a WS upgrade through the dashboard's canonical auth gate."""
     try:
         from hermes_cli import web_server_chat as _ws
+        return bool(_ws._ws_auth_ok(ws))
     except Exception:
-        return True
-    return bool(_ws._ws_auth_ok(ws))
+        return False
 
 
 def _normalize_slug_or_400(slug: str) -> Optional[str]:
