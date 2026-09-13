@@ -1,0 +1,63 @@
+{
+  "reviewer_id": "L05",
+  "verdict": "confirmed_contributing_mechanism",
+  "findings": [
+    {
+      "claim": "cron/scheduler.py does NOT hold a persistent SessionDB handle across ticks; it acquires one per job run and releases it at end-of-run, both through the process-local shared registry (hermes_state_registry), not a bare SessionDB().",
+      "evidence": "_open_cron_session_db() calls `from hermes_state_registry import acquire; ... return acquire()` to open the session store for a job, and _finalize_cron_session() calls `from hermes_state_registry import release_or_close; release_or_close(_session_db)` after the run completes. These are the only two hermes_state_registry touch points in the file; there is no scheduler-startup acquire() that stays open for the life of the subprocess.",
+      "file": "cron/scheduler.py",
+      "line": "1589-1632 (_open_cron_session_db, acquire at 1603-1606), 1911-1915 (_finalize_cron_session, release_or_close)"
+    },
+    {
+      "claim": "Because acquire/release is registry-routed but the registry is PROCESS-LOCAL (module-level dict in hermes_state_registry.py), the cron scheduler subprocess maintains its own independent generation/refcount bookkeeping completely separate from the gateway/dashboard process's registry, even though both point at the same on-disk ~/.hermes/state.db path.",
+      "evidence": "hermes_state_registry.py's docstring: 'This module owns that boundary: one shared SessionDB per resolved path per process, refcounted' (line 6) and `_generations: Dict[Path, _Generation] = {}` is a plain module global (line 83) with no cross-process coordination beyond the SQLite file itself.",
+      "file": "hermes_state_registry.py",
+      "line": "1-8, 80-88"
+    },
+    {
+      "claim": "In the common case of one job running at a time in the cron subprocess (no overlapping fires), refcount reaches 0 after every job's _finalize_cron_session, so release_or_close() triggers an IMMEDIATE physical teardown/close of that generation rather than keeping the handle warm between ticks.",
+      "evidence": "release(db) decrements refcount and calls needs_teardown = generation.refcount <= 0; when true it immediately admits and runs _teardown_generation -> _teardown -> db.close() outside the lock. There is no idle-keep-alive/pooling window: the next job's acquire() (even seconds later) opens a brand NEW SessionDB/sqlite3 connection.",
+      "file": "hermes_state_registry.py",
+      "line": "276-309 (release), 108-113 (_teardown)"
+    },
+    {
+      "claim": "Each such close() performs a legitimate close-time WAL checkpoint via the underlying sqlite3 connection close, which (per this codebase's own documented SQLite behavior) unlinks the -wal/-shm sidecars on a clean close, i.e. ends that WAL generation.",
+      "evidence": "SessionDB.close(): 'elif not self.read_only and not generation_lost: ... self._conn.execute(\"PRAGMA wal_checkpoint(PASSIVE)\") ... conn.close()'. An adjacent comment in the same file explicitly documents that a clean close ends the generation: 'close() mutates _conn and _db_sidecar_identity under that same lock, ending the WAL generation (SQLite unlinks the -wal/-shm sidecars on a clean close)'.",
+      "file": "hermes_state.py",
+      "line": "1336-1397 (close()); 'ending the WAL generation' comment at 870-871"
+    },
+    {
+      "claim": "The scheduler.py code itself calls out that per-job open/close cycling of the session store is HIGH FREQUENCY ('many times/hour') and was already the reason its own periodic in-band checkpoint was made PASSIVE instead of TRUNCATE, i.e. the authors were already aware this pattern stresses the shared WAL.",
+      "evidence": "Comment directly above the PASSIVE checkpoint call: 'Every cron run_agent opens+closes a transient SessionDB, so a TRUNCATE here fires a full WAL reset many times/hour, racing the gateway's long-lived writer on large WAL databases and tearing hot B-tree pages -- the #45383 corruption this class's own periodic checkpoint was already made PASSIVE to avoid.'",
+      "file": "hermes_state.py",
+      "line": "1379-1388"
+    },
+    {
+      "claim": "The gateway's own shutdown path documents the exact failure mode this audit is investigating: a SessionDB.close() elsewhere (a second writer) checkpoints and ends the WAL generation, and a later write against the gateway's long-lived handle silently reopens onto a NEW generation, producing the split/'#94736'/'#101064' corruption class that DeletedWalGenerationError is designed to detect and refuse.",
+      "evidence": "'SessionDB.close() checkpointed the WAL reopens the handle and splits the WAL generation (close-time corruption)... The late write silently reopens the handle (#94736) and mints a fresh WAL generation behind that checkpoint... the close-time page-write damage in #101093 and the split WAL generation in #101064.'",
+      "file": "gateway/run_shutdown.py",
+      "line": "1758-1770"
+    },
+    {
+      "claim": "DeletedWalGenerationError itself is exactly the guard a long-lived gateway/dashboard SessionDB handle raises when it detects, on its next write, that its recorded WAL/SHM sidecar identity no longer matches what's on disk (i.e. some other process/handle closed and rotated the generation out from under it) -- consistent with a second, independently-cycling writer (the cron subprocess) being the trigger.",
+      "evidence": "`_raise_if_db_replaced()` runs inside the write lock before every BEGIN IMMEDIATE (hermes_state.py ~868-884), and `_wal_generation_was_lost()` / `refuse_deleted_wal_generation()` in hermes_state_dbfile.py raise `DeletedWalGenerationError` once the sidecar identity check fails; `hermes_state_errors.py` classifies this as a 'deleted_wal' StateDbReplacedError subtype.",
+      "file": "hermes_state_dbfile.py",
+      "line": "207-215 (refuse_deleted_wal_generation), see also hermes_state.py 1076-1128 (_wal_generation_was_lost / halt path)"
+    },
+    {
+      "claim": "cron/jobs.py contains no SessionDB usage at all -- it only handles job scheduling/locking (fire fences via flock) and never opens the session store; all SessionDB interaction for cron runs lives in cron/scheduler.py's run_job path.",
+      "evidence": "A repo-wide search of cron/jobs.py for 'SessionDB|session_db|hermes_state_registry|acquire' matched only the unrelated job-lock helpers `_acquire_flock`, `_fire_job_lock`, etc. (lines 204-358); no SessionDB references.",
+      "file": "cron/jobs.py",
+      "line": "204-358 (no SessionDB references anywhere in file)"
+    },
+    {
+      "claim": "The specific 'system-watch-snapshot' cron job cited in the incident is user/profile configuration data (a scheduled job entry), not a code path in this repo -- its 2-minute cadence is exactly the kind of tight-interval fire that would repeatedly exercise the acquire()/release_or_close() open-close-checkpoint cycle described above in the separate cron subprocess.",
+      "evidence": "A repo-wide search for the literal job name 'system-watch-snapshot' returned zero matches in claude-code source; it must be a runtime job record (jobs store, not tracked in this checkout), consistent with it being one of 'other scheduled jobs' driving frequent run_job() invocations through the same _open_cron_session_db/_finalize_cron_session path documented above.",
+      "file": "cron/scheduler.py",
+      "line": "N/A (job identity not present in source; mechanism it would exercise is at 1589-1632 and 1829-1915)"
+    }
+  ],
+  "confidence": 0.78,
+  "recommended_action": "Treat the cron scheduler subprocess as a second, independent SessionDB writer lifecycle against the same ~/.hermes/state.db: every cron job run (including tight-interval jobs like a 2-minute 'system-watch-snapshot') acquires a per-process-registry handle that is opened fresh and physically closed+checkpointed (ending its WAL generation) whenever the cron process's local refcount drops to 0, which in the common non-overlapping-job case is after essentially every run. This is registry-routed (not a rogue bare SessionDB()) so it is not violating the shared-writer contract by itself, but because the registry is per-process, the cron subprocess's frequent close cycles are NOT visible to or coordinated with the gateway/dashboard process's own long-lived handle, and gateway/run_shutdown.py's own comments confirm this exact interleaving (a second writer's close() minting a fresh WAL generation behind an in-flight/long-lived handle) is the documented cause of #94736/#101093/#101064 corruption and is what DeletedWalGenerationError is designed to detect. Recommend: (1) confirm empirically by correlating state.db-wal inode/mtime churn with cron job run timestamps during an incident window; (2) consider extending the shared-registry model across processes (e.g. a cross-process advisory lock or a longer-lived idle-keepalive in the cron subprocess to avoid a close+reopen on every single job when jobs fire close together) rather than closing to zero-refcount on every run; (3) do not change cron/jobs.py, which has no SessionDB involvement and is not implicated.",
+  "extra_note_retry": "Corrected workspace path from the earlier failed attempt (/home/ian-koratsky/.hermes/claude-code, which does not exist) to the live install at /home/ian-koratsky/.hermes/hermes-agent, per task context."
+}

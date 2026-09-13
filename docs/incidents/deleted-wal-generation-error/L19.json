@@ -1,0 +1,51 @@
+{
+  "reviewer_id": "L19",
+  "verdict": "no_race_found_premise_unsupported",
+  "findings": [
+    {
+      "claim": "gateway.multiplex_profiles is NOT enabled on this host; the incident's stated premise (one process multiplexing many profiles) does not match the live system.",
+      "evidence": "~/.hermes/config.yaml has no top-level 'gateway:' key at all (python yaml.safe_load shows 'gateway' in d == False), so multiplex_profiles falls back to the hardcoded default False in config_defaults.py. No GATEWAY_MULTIPLEX_PROFILES env override is set in the systemd unit's Environment= line or in ~/.hermes/.env.",
+      "file": "hermes_cli/config_defaults.py",
+      "line": 1961
+    },
+    {
+      "claim": "The single running gateway process (pid 1146135) only holds file descriptors on the DEFAULT profile's own state.db, not on any other profile's state.db -- contradicting the stated observation that one process holds fds open on all 14 profiles' dbs simultaneously.",
+      "evidence": "`ls -la /proc/1146135/fd` and `lsof -p 1146135` show every state.db/-wal/-shm fd resolves to /home/ian-koratsky/.hermes/state.db{,-wal,-shm} only (the process's own HERMES_HOME=/home/ian-koratsky/.hermes per /proc/1146135/environ). No fds point into /home/ian-koratsky/.hermes/profiles/*/state.db.",
+      "file": "N/A (live process inspection)",
+      "line": 0
+    },
+    {
+      "claim": "Six named profiles (architecture-builder, reviewer, builder, orchestration-lead, security-engineer, test-verification) each previously ran their OWN standalone gateway process with a DIFFERENT pid and their own hermes_home recorded in a per-profile gateway.lock -- this is the standard non-multiplexed architecture (one process per profile), not one process serving many.",
+      "evidence": "cat of each profile's gateway.lock shows {pid, argv, hermes_home: /home/ian-koratsky/.hermes/profiles/<name>} with 6 distinct dead PIDs (3623129, 3623184, 198019, 3623162, 3623212, 3623243); `kill -0` on all six returns 'no such process'. This is inconsistent with a live single multiplexed process; it looks like leftover locks from prior standalone per-profile gateway runs that crashed or were killed without cleanup.",
+      "file": "profiles/<name>/gateway.lock",
+      "line": 0
+    },
+    {
+      "claim": "get_hermes_home()/hermes_home_key() use a single process-wide ContextVar (_HERMES_HOME_OVERRIDE) that IS correctly asyncio-Task-isolated by Python's own contextvars semantics: asyncio.create_task() copies the current Context at task-creation time, so two concurrently-running sibling asyncio Tasks calling set_hermes_home_override() do not see each other's override.",
+      "claim2_the_real_risk": "The documented, already-fixed risk was NOT a Task-vs-Task race but a Task-vs-thread-pool-worker context LOSS: a bare `loop.run_in_executor(None, fn)` or `asyncio.to_thread(fn)` executor worker starts with an EMPTY Context (not a copy of the caller's), so a profile override set via set_hermes_home_override() before the executor hop is silently dropped, and get_hermes_home() then falls through to the process env HERMES_HOME -- i.e. the DEFAULT profile's home. Comments and regression tests (test_multiplex_background_task_scope.py, issue #100849 referenced in code) confirm this was found and fixed by wrapping call sites in copy_context().run(...) or the _run_in_executor_with_context helper / _profile_runtime_scope context manager.",
+      "evidence": "hermes_constants.py:17 defines the ContextVar; gateway/run_turn.py:1177-1189 explicitly comments 'MUST run inside the caller's contextvars: under multiplex_profiles the profile secret scope / HERMES_HOME override live in ContextVars, and a bare run_in_executor worker starts with an empty Context ... fails closed (#100849 bundle)' and fixes it via `copy_context().run`. gateway/run_profile_reconcile.py:173 does the same. gateway/slash_commands.py:1052/1205 route through `_run_in_executor_with_context` specifically to avoid this class of bug.",
+      "file": "gateway/run_turn.py",
+      "line": 1184
+    },
+    {
+      "claim": "A second, already-fixed analogous bug class matches the incident's exact symptom shape (a named profile's writes landing in the DEFAULT profile's state.db): SessionStore used to bind a single SessionDB handle at __init__ time (process start, root/default home) instead of re-resolving it per active scope, so a routed profile's session rows were physically written to the root state.db even though _profile_runtime_scope had redirected get_hermes_home() for that turn. A corollary bug (#66887) affected background walkers (e.g. the session-expiry watcher) that hold no scope at all and iterate a single process-wide _entries dict spanning all profiles.",
+      "evidence": "tests/gateway/test_multiplex_session_db_profile_scope.py docstring: 'A multiplexed gateway serves every profile from one process. SessionStore used to bind a single SessionDB during __init__, freezing it to the process's own root home ... so a named profile's sessions were physically written to the root state.db ... The rows carried the correct profile_name, which is why the only visible symptom was the desktop listing a profile's session under the default bot.' Both regression tests exist and encode the fix (resolve store from active scope / from the key), i.e. this exact class of bug is already covered by tests in the current tree.",
+      "file": "tests/gateway/test_multiplex_session_db_profile_scope.py",
+      "line": 1
+    },
+    {
+      "claim": "No open/unpatched instance of the contextvar-loses-scope bug class was found in this pass across gateway/*.py's to_thread/run_in_executor call sites; each site inspected either uses copy_context().run, _run_in_executor_with_context, or asyncio.to_thread (which DOES propagate the current contextvars.Context by design, unlike a bare loop.run_in_executor call with an uncaptured function).",
+      "evidence": "grep of gateway/*.py for run_in_executor|to_thread|ThreadPoolExecutor shows multiple asyncio.to_thread(...) call sites (slash_commands.py, run_busy.py, run_watchers.py, wake.py, session.py, shutdown_watchdog.py, kanban_watchers_notifier.py) — asyncio.to_thread wraps functools.partial(copy_context().run, func, ...) internally per CPython stdlib, so these are context-safe by construction; the two identified needing manual copy_context().run are the two already fixed above.",
+      "file": "gateway/*.py",
+      "line": 0
+    },
+    {
+      "claim": "The most plausible immediate cause of the recurring DeletedWalGenerationError on this host, given multiplex is OFF, is multiple SEPARATE processes (not concurrent async tasks in one process) opening the SAME default state.db concurrently -- e.g. the running hermes CLI (pid 1139237), the dashboard backend (pid 1144279), and the gateway (pid 1146135) all share HERMES_HOME=/home/ian-koratsky/.hermes and each independently manages WAL lifecycle against the same file, which is the documented trigger for refuse_deleted_wal_generation/DeletedWalGenerationError (a second opener minting a replacement WAL inode while a prior opener still holds the deleted generation open).",
+      "evidence": "hermes_state_dbfile.py:207-215 refuse_deleted_wal_generation raises DeletedWalGenerationError when iter_deleted_sqlite_sidecar_holders(db_path) finds ANY process holding a deleted WAL/SHM generation for that db_path -- this is fundamentally a same-db-path-shared-across-processes condition, not a contextvar/task-scoping condition. `ps aux` shows 3 independent long-lived processes (hermes CLI, dashboard, gateway) all rooted at the same default HERMES_HOME, each capable of opening/closing state.db independently.",
+      "file": "hermes_state_dbfile.py",
+      "line": 207
+    }
+  ],
+  "confidence": 0.72,
+  "recommended_action": "Do not treat this as a multiplex-contextvar race: multiplex_profiles is currently False/absent on this host and the running gateway's fds only touch the default profile's own state.db. Before assuming a code-level fix is needed, (1) confirm with the operator whether they intended multiplex_profiles=true and it was never actually enabled (config drift), (2) check whether the 6 dead per-profile gateway.lock files indicate crashed/duplicate standalone gateway launches that need cleanup (`hermes gateway status`/`--force` cleanup) rather than a live bug, and (3) investigate the DeletedWalGenerationError as multiple independent processes (CLI, dashboard, gateway) sharing one default state.db rather than as a contextvar isolation bug -- the two known contextvar/session-scope bug classes that WOULD produce this exact symptom (#100849 executor-context-loss, #88532/#66887 SessionStore binding) already have regression tests in the current tree (test_multiplex_background_task_scope.py, test_multiplex_session_db_profile_scope.py) and appear fixed, not reproducible as new evidence. If multiplex_profiles is later enabled, re-audit specifically for any NEW asyncio.create_task/run_in_executor call site added after this fix that skips copy_context().run or _profile_runtime_scope."
+}

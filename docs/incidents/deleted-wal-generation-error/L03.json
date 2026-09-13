@@ -1,0 +1,44 @@
+{
+  "reviewer_id": "L03",
+  "verdict": "tui_gateway opens its own SessionDB writer handle on ~/.hermes/state.db, coordinated only within its own OS process (via hermes_state_registry's in-memory threading.Lock singleton). There is NO cross-process coordination/locking between tui_gateway (hermes --tui / hermes serve / desktop-spawned backend) and hermes-gateway.service / hermes-dashboard.service. Each is a separate OS process with its own Python interpreter and its own module-level _generations registry, so they are independent SessionDB writer handles racing on the same SQLite file, arbitrated only by SQLite's own WAL/locking (plus a best-effort deleted-WAL-generation detector that inspects /proc fds, not a true distributed lock).",
+  "findings": [
+    {
+      "claim": "tui_gateway/server.py opens its own SessionDB writer handle onto state.db via the process-local registry, keyed off get_hermes_home()/_hermes_home.",
+      "evidence": "_get_db() calls `from hermes_state_registry import acquire; _db, _db_error = acquire(Path(_hermes_home) / \"state.db\"), None` and caches the handle in a module-global `_db` for the lifetime of this process.",
+      "file": "tui_gateway/server.py",
+      "line": 383
+    },
+    {
+      "claim": "tui_gateway also opens DEDICATED per-profile state.db writer handles for multiplex/profile sessions, independent of the launch handle.",
+      "evidence": "_open_profile_session_db() and the profile branch of the surrounding function both call `acquire(Path(profile_home) / \"state.db\")` — a second/Nth writer handle inside the same tui_gateway process, on top of the shared launch handle from _get_db().",
+      "file": "tui_gateway/server.py",
+      "line": 421
+    },
+    {
+      "claim": "The `acquire()` registry that tui_gateway (and gateway/, cron, other in-process callers) use to dedupe SessionDB handles is an in-process, in-memory structure — a threading.Lock and a plain dict, not any OS-level (flock/fcntl/named-mutex/semaphore) primitive that could span processes.",
+      "evidence": "`_lock = threading.Lock()` guarding `_generations: Dict[Path, _Generation] = {}` and `_opening: Dict[Path, threading.Event] = {}`; per-path locking only synchronizes threads sharing the same Python process memory space.",
+      "file": "hermes_state_registry.py",
+      "line": 80
+    },
+    {
+      "claim": "hermes_state.py's own design comment explicitly documents that the shared-registry dedupe is a per-process contract (\"long-lived in-process callers ... share ONE writer connection per resolved path via hermes_state_registry.acquire()\"), implying no claim of cross-process coordination.",
+      "evidence": "Comment block: \"Process-wide shared SessionDB registry (#90837) ... Long-lived in-process callers (gateway, tui_gateway, cron, in-process tools) share ONE writer connection per resolved path via hermes_state_registry.acquire()\" — 'process-wide' here means within a single process, not across the fleet of processes (gateway.service, dashboard.service, tui_gateway, desktop-spawned serve) that each run this same module fresh.",
+      "file": "hermes_state.py",
+      "line": 324
+    },
+    {
+      "claim": "The only cross-process safety net is a best-effort /proc-based detector for deleted WAL/SHM sidecars, not a true distributed lock — it can only detect an already-lost generation after the fact, not prevent two independent processes from racing to open/checkpoint state.db concurrently.",
+      "evidence": "iter_deleted_sqlite_sidecar_holders() docstring: \"Return processes holding an unlinked state.db-wal / -shm. Linux-only ... Includes this process\" — implemented via /proc/<pid>/fd scanning, which is advisory/observational, not a lock that blocks other processes from opening a new WAL generation.",
+      "file": "hermes_state_dbfile.py",
+      "line": 187
+    },
+    {
+      "claim": "methods_profiles.py independently documents that a second writable SessionDB() on the SAME state.db from another concurrent opener stalls for up to 20s on the write lock and runs DDL, showing multiple independent writer opens onto the same file are an expected, tolerated (if slow) occurrence rather than something structurally prevented.",
+      "evidence": "\"a writable `SessionDB()` waits up to 20s for the write lock + runs DDL and stalled the 5s roster poll\" — the fix taken here was to use a read-only attach for the roster poll specifically to avoid contending with the real writer, confirming multiple writers CAN and DO open onto the same file.",
+      "file": "tui_gateway/methods_profiles.py",
+      "line": 208
+    }
+  ],
+  "confidence": 0.85,
+  "recommended_action": "Treat hermes_state_registry.acquire() as a per-process singleton only — it does not protect ~/.hermes/state.db from concurrent OS-process writers. Since hermes-gateway.service, hermes-dashboard.service, tui_gateway (hermes --tui / hermes serve), and the Electron desktop app's spawned `hermes_cli.main serve` backend are independent processes that can all resolve to the same default-profile state.db path, they are racing on the same SQLite file via WAL with only SQLite's own file locking and a best-effort deleted-generation detector arbitrating them. To fix the DeletedWalGenerationError recurrence, either (a) ensure only ONE of these process roles is ever the writer for a given profile's state.db at a time (e.g. gateway.service is the sole writer and others attach read-only or proxy writes through it), or (b) add real cross-process coordination (an OS-level advisory lock file, e.g. flock() on a sidecar lock, acquired before any process calls SessionDB()/acquire()) so a second process cannot open a competing WAL generation while another is closing/checkpointing. This audit did not test runtime behavior; recommend a targeted repro (start hermes-gateway.service and a `hermes --tui` against the same profile home, restart the service, and watch for DeletedWalGenerationError) to confirm the mechanism before landing a fix."
+}

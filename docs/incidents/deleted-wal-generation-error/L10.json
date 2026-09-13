@@ -1,0 +1,44 @@
+{
+  "reviewer_id": "L10",
+  "verdict": "confirmed",
+  "findings": [
+    {
+      "claim": "profiles.list_profiles() (hermes_cli/profiles.py) always includes the DEFAULT profile in the roster it returns, using the same absolute state.db path the gateway's own writer handle uses.",
+      "evidence": "list_profiles() appends _profile_info(\"default\", default_home, is_default=True) via default_home = _get_default_hermes_home() before iterating named profiles, so 'default' is not special-cased out of aggregation loops that walk the returned list.",
+      "file": "hermes_cli/profiles.py",
+      "line": 691
+    },
+    {
+      "claim": "The cross-profile aggregation loop in the TUI/dashboard gateway (profiles.list handler) opens a fresh read-only SessionDB() handle for EVERY profile row returned by list_profiles(), including the default profile, with no dedup against the process's existing writer handle on that same file.",
+      "evidence": "In profiles.list handler: `for p in list_profiles(): ... if include_sessions: _profile_session_fields(row, p.path)`. _profile_session_fields() does `db_path = Path(profile_path)/\"state.db\"` then `SessionDB(db_path=db_path, read_only=True)` directly -- a raw constructor call, not routed through hermes_state_registry.acquire() which would dedup/refcount an existing handle for that path.",
+      "file": "tui_gateway/methods_profiles.py",
+      "line": 214
+    },
+    {
+      "claim": "Because default_home resolves to the exact same state.db path the multiplexer's own default-profile writer handle uses, this loop opens a SECOND, independent, unshared read-only sqlite3 connection on the default profile's live database on every roster poll (docstring states this runs on a ~5s roster poll cadence).",
+      "evidence": "Docstring: 'The DB is a read-only attach (a writable SessionDB() waits up to 20s for the write lock + runs DDL and stalled the 5s roster poll)' -- confirms periodic (5s) re-open, and the constructor is unconditional per row, not skipped for is_default rows.",
+      "file": "tui_gateway/methods_profiles.py",
+      "line": 207
+    },
+    {
+      "claim": "SessionDB._open_read_only()'s own docstring frames this mechanism explicitly as the cross-profile aggregation path, confirming methods_profiles.py's loop is the referenced code path.",
+      "evidence": "\"Read-only attach for cross-profile aggregation: no schema init, NO write lock (sidebar polling never contends with that profile's backend); the DB must exist.\"",
+      "file": "hermes_state.py",
+      "line": 588
+    },
+    {
+      "claim": "The read-only open path retries on IO errors and probes FTS tables with SELECTs, closing itself on ANY probe failure -- but nothing in this path checks whether the target path equals the process's own default HERMES_HOME/state.db, so no self-exclusion guard exists to prevent opening a duplicate handle on the default db.",
+      "evidence": "_open_read_only() loops attempts, calls self._connect_read_only(timeout=1.0), applies pragmas, probes messages_fts / messages_fts_trigram, and on BaseException closes the connection -- none of this logic is conditioned on db_path vs the running profile's own home.",
+      "file": "hermes_state.py",
+      "line": 594
+    },
+    {
+      "claim": "gateway/platforms/webhook.py's profile-serving enumeration (`profiles_to_serve(multiplex=True)`), used to gate HTTP admission, likewise treats 'default' as just another served profile name with no special exclusion, consistent with the aggregation loop's failure to skip default.",
+      "evidence": "`served = {name for name, _ in profiles_to_serve(multiplex=True)}` -- 'default' is present in this set per profiles_to_serve's own docstring ('default plus every live named profile').",
+      "file": "gateway/platforms/webhook.py",
+      "line": 407
+    }
+  ],
+  "confidence": 0.75,
+  "recommended_action": "In methods_profiles.py's roster loop (profiles.list handler / _profile_session_fields), skip opening a new read-only SessionDB for rows where p.is_default is True (or more generally where p.path resolves to the same real path as the active/default HERMES_HOME), and instead reuse/route through the process's already-open default writer handle (or the shared hermes_state_registry) for that row's session data. This avoids stacking a repeated (every ~5s) independent read-only sqlite3 connection on top of the default profile's own live writer handle, which is a plausible contributor to file-descriptor/WAL-generation churn on state.db (though the observed DeletedWalGenerationError symptom set spans many named profiles too, so the same dedup fix should be verified against hermes_state_registry usage for named-profile reads as well before treating this as the sole root cause)."
+}

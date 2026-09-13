@@ -1,0 +1,42 @@
+{
+  "reviewer_id": "L13",
+  "verdict": "not_reproduced",
+  "findings": [
+    {
+      "claim": "Two SessionDB writer handles opened directly (bypassing hermes_state_registry) against the SAME db_path, in the SAME process, where handle A writes then is explicitly close()'d (and separately dropped+gc.collect()'d) before handle B writes, do NOT trigger DeletedWalGenerationError. Handle B's write succeeds normally 3/3 runs.",
+      "evidence": "Script output: 'handle_a.append_message OK, msg_id=1' -> '-wal exists after handle_a write: True' -> 'handle_a.close() completed (no exception)' -> '-wal exists after handle_a close: True' -> 'handle_b.append_message OK, msg_id=2'. Repeated identically across 3 independent runs in fresh tempfile.mkdtemp() HERMES_HOME dirs.",
+      "file": "/home/ian-koratsky/.hermes/claude-code-swarm-wal/L13_repro.py",
+      "line": 100
+    },
+    {
+      "claim": "The mechanism is explained by SessionDB.close(): its close-time behavior is a PASSIVE wal_checkpoint, deliberately NOT TRUNCATE, precisely so it does not reset/unlink the -wal file and race a sibling writer. A PASSIVE checkpoint leaves the -wal sidecar's inode identity unchanged (confirmed empirically: '-wal exists after handle_a close: True', same file, not unlinked/replaced) -- there is no deleted-generation event for DeletedWalGenerationError's guard (refuse_deleted_wal_generation / _wal_generation_was_lost) to detect, so handle B's own recorded sidecar identity is still valid and its write proceeds.",
+      "file": "/home/ian-koratsky/.hermes/hermes-agent/hermes_state.py",
+      "line": 1379
+    },
+    {
+      "claim": "DeletedWalGenerationError's guard (refuse_deleted_wal_generation, called from open, and _wal_generation_was_lost, checked on write/close) is specifically keyed to an UNLINKED/replaced -wal or -shm inode -- i.e. it requires the sidecar to actually be deleted or re-minted as a new generation on disk, a condition that a same-process, same-connection-lifecycle PASSIVE-checkpoint close does not create. The existing regression suite (tests/hermes_state/test_deleted_wal_generation_guard.py) only reproduces the error via explicit sidecar unlink (lose_sidecars(), which os.unlink()s the -wal/-shm) or via a SEPARATE process minting a second generation on the path (write_second_generation(), whose own docstring says two live handles on one db IN ONE PROCESS collide on the -shm instead of this failure mode) -- both external interventions, neither of which occurs merely from opening two handles and closing one normally.",
+      "file": "/home/ian-koratsky/.hermes/hermes-agent/tests/hermes_state/_wal_generation_harness.py",
+      "line": 52
+    },
+    {
+      "claim": "The '5 live SessionDB handles' warning seen in production logs is therefore NOT, by itself, sufficient to cause DeletedWalGenerationError under this repro's conditions (clean opens, clean writes, ordinary close()). Reproducing the incident requires an ADDITIONAL out-of-band event that actually unlinks or replaces the -wal/-shm generation while a writer still holds it -- e.g. an external process/tool deleting the sidecar files, a crash/kill that skips the PASSIVE close-time checkpoint and leaves a stale generation another opener then replaces, a TRUNCATE-mode checkpoint racing another live writer (explicitly the scenario SessionDB.close()'s docstring says PASSIVE avoids), or a restore/cp/mv of state.db underneath a live process. Multiple live handles are a necessary precondition for that race window to matter (more handles = more surface for one of them to be caught mid-checkpoint by an external mutation) but not sufficient on their own.",
+      "file": "/home/ian-koratsky/.hermes/hermes-agent/hermes_state_dbfile.py",
+      "line": 207
+    },
+    {
+      "claim": "This host's SQLite (3.46.1) is flagged wal-reset-vulnerable, so a naive repro without pinning WAL mode silently falls back to journal_mode=DELETE and cannot exercise the bug at all (first script iteration hit an unrelated sqlite3.IntegrityError instead). The repro script pins hermes_state_wal.is_sqlite_wal_reset_vulnerable=False and resolve_journal_mode='wal', matching the pin_wal() fixture used by the project's own WAL-generation test harness, to force real WAL mode.",
+      "file": "/home/ian-koratsky/.hermes/hermes-agent/tests/hermes_state/_wal_generation_harness.py",
+      "line": 26
+    }
+  ],
+  "confidence": 0.85,
+  "recommended_action": "Do not treat 'N live SessionDB handles in one process' as the root cause on its own. Narrow the incident search to what actually unlinks/replaces the -wal or -shm inode underneath a live writer in production: (1) audit for any code path or external tool (backup script, `hermes sessions recover`, manual `rm`/`cp` on state.db, container volume resets) that can touch the sidecar files while a writer PID is alive; (2) check whether a crash or SIGKILL on one of the many live handles skips its PASSIVE close-time checkpoint and leaves a generation that a later opener's WAL-mode PRAGMA then replaces (the exact SessionDB(db_path=path) sequence covered by test_second_sessiondb_open_refuses_and_does_not_mint_wal, but requiring TWO PROCESSES / TWO SEPARATE OPENS after a real generation loss, not two handles in one process); (3) extend this repro to simulate a hard-kill (os._exit or SIGKILL) of one handle's process mid-write instead of a clean close(), and to simulate a genuinely separate process attempting to open the same path after that -- both remain to be tried and are more promising leads than the pure in-process multi-handle hypothesis this lane tested and ruled out.",
+  "repro_script": "/home/ian-koratsky/.hermes/claude-code-swarm-wal/L13_repro.py",
+  "reproduction_steps": [
+    "cd /home/ian-koratsky/.hermes/hermes-agent",
+    "PYTHONPATH=. python3 /home/ian-koratsky/.hermes/claude-code-swarm-wal/L13_repro.py",
+    "Script internally: tempfile.mkdtemp() -> HERMES_HOME env var -> pins WAL mode (host SQLite 3.46.1 is wal-reset-vulnerable and would otherwise fall back to DELETE) -> imports hermes_state -> constructs SessionDB(db_path=tmp/state.db) TWICE directly (handle_a, handle_b), bypassing hermes_state_registry -> handle_a.create_session + handle_a.append_message (succeeds, -wal created) -> handle_a.close() (PASSIVE checkpoint, -wal survives, no exception) -> del handle_a; gc.collect() -> handle_b.append_message (SAME db_path, different connection)",
+    "Result across 3 runs: handle_b.append_message always succeeds (msg_id=2); DeletedWalGenerationError never raised."
+  ],
+  "outcome": "did_not_reproduce"
+}

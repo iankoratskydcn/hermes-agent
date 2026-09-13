@@ -1,0 +1,40 @@
+{
+  "reviewer_id": "L02",
+  "verdict": "ruled_out",
+  "findings": [
+    {
+      "claim": "gateway/*.py contains zero ad-hoc/bare `SessionDB(...)` instantiation sites; both real call sites resolve through the process-wide shared registry (hermes_state_registry.acquire), keyed by resolved db path.",
+      "evidence": "Grep of `SessionDB(` in gateway/*.py returns exactly 2 files: gateway/run.py and gateway/slash_commands_status.py. In run.py, GatewayRunner._open_session_db_for_active_scope() (the only place that opens a session-DB handle for the gateway's own turn loop) either borrows session_store's existing handle (AsyncSessionDB(borrowed)) or calls `AsyncSessionDB(acquire())` where acquire is hermes_state_registry.acquire — never a bare SessionDB(). gateway/slash_commands_status.py only imports SessionDB for `SessionDB.sanitize_title(...)`, a static/classmethod call, and separately calls `release_or_close(db)` (registry-aware release), not `SessionDB(...)` instantiation.",
+      "file": "gateway/run.py",
+      "line": 3709
+    },
+    {
+      "claim": "gateway/session_persistence.py (SessionStore's storage mixin, used by every gateway request path) also routes exclusively through hermes_state_registry.acquire(path), one handle per resolved path, with an explicit comment: 'process-wide registry: one writer per path'.",
+      "file": "gateway/session_persistence.py",
+      "line": 61
+    },
+    {
+      "claim": "GatewayRunner explicitly avoided opening a second writer against the same file: _open_session_db_for_active_scope() borrows session_store._db (the SAME registry-backed handle) instead of calling acquire() again, specifically citing #98573 ('the process was holding two writer connections and two read pools against one state.db').",
+      "file": "gateway/run.py",
+      "line": 3738
+    },
+    {
+      "claim": "The '%d live SessionDB handles on %s in this process' warning is emitted by _PathReadBudget.register(), which is called from EVERY SessionDB.__init__ (registry-managed or bare) via a process-wide WeakSet keyed by db path -- so the counter reflects ALL SessionDB objects ever constructed on that path in the process, not specifically gateway-created ones.",
+      "file": "hermes_state_readpool.py",
+      "line": 160
+    },
+    {
+      "claim": "Numerous bare, un-registry-routed `SessionDB()`/`SessionDB(db_path=...)` construction sites exist elsewhere in the same process's import surface (CLI subcommands, plugins, kanban legacy retag) that gateway can invoke in-process: hermes_cli/status.py, hermes_cli/sessions_cmd.py, hermes_cli/terminal_breadcrumbs.py, hermes_cli/oneshot.py, hermes_cli/main_tui_launch.py, hermes_cli/kanban_db_dispatch.py (_retag_legacy_worker_sessions), plugins/hermes-achievements/dashboard/plugin_api.py (scan_sessions). These are documented by design as 'one-shots use SessionDB() + close()' (hermes_state.py:364-365) and are meant to open/close quickly rather than share the registry.",
+      "file": "hermes_cli/kanban_db_dispatch.py",
+      "line": 2085
+    },
+    {
+      "claim": "The read-budget WeakSet only drops an entry when the SessionDB object is actually garbage-collected -- a properly closed but still-referenced one-shot handle (e.g. held by a local variable in a slow generator, a caller that forgot to drop its reference, or simply not yet cycle-collected) can still count toward 'live handles' even though its connection is closed. The warning is a diagnostic heuristic (`_duplicate_handles_warned` fires once, latched), not proof of concurrent open writer connections.",
+      "file": "hermes_state_readpool.py",
+      "line": 164
+    }
+  ],
+  "confidence": 0.72,
+  "recommended_action": "Ruled out gateway/*.py as the source of ad hoc/duplicate SessionDB() writer instantiation: both gateway call paths (GatewayRunner._open_session_db_for_active_scope, SessionStore/session_persistence._open_session_db_for_active_scope) correctly funnel through hermes_state_registry.acquire() and even actively de-duplicate against each other (session_store handle borrowing, #98573 fix). The '5 live SessionDB handles' warning is process-wide (WeakSet keyed by db path across ALL SessionDB() call sites, not gateway-specific) and can include short-lived one-shot bare SessionDB() instances from in-process CLI/plugin code paths (status.py, sessions_cmd.py, kanban_db_dispatch.py, hermes-achievements plugin) that are lingering due to GC lag or a missed close(), not concurrent writers. Recommend: (1) have another lane (or a follow-up) capture the actual warning's traceback/registry.stats() at the moment it fires to identify which non-gateway module's SessionDB objects are still referenced; (2) separately investigate whether DeletedWalGenerationError correlates with a bare SessionDB() from one of these one-shot call sites racing a registry-owned handle's WAL checkpoint on the SAME file, which the registry's own docstring (#102827) says it exists to forbid -- but only for registry-tracked generations, not for external bare opens on the same path.",
+  "confidence_note": "Registry design in gateway/*.py itself looks correct; the 5-handle warning likely originates outside gateway/*.py proper, in the same process."
+}

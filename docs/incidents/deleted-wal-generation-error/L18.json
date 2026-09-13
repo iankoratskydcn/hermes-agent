@@ -1,0 +1,68 @@
+{
+  "reviewer_id": "L18",
+  "verdict": "Neither curator nor background_review spawns a new OS-level forked/subprocess agent run, and neither opens an independent SessionDB writer handle against ~/.hermes/state.db. Both spawn an in-process daemon thread that runs a fresh AIAgent instance ('the fork') inside the SAME process, and both explicitly detach that fork from persistence (session_db defaults to/forced to None, _persist_disabled=True). So there is no parent/child writer-handle race via these two auto-trigger mechanisms as currently implemented; they are not the source of DeletedWalGenerationError.",
+  "findings": [
+    {
+      "claim": "Curator auto-trigger is idle-gated and runs via threading.Thread (in-process), not a subprocess/fork() of a new OS process.",
+      "evidence": "run_curator_review() starts threading.Thread(target=_llm_pass, daemon=True, name='curator-review').start() unless synchronous=True; maybe_run_curator() (the idle-triggered entrypoint) calls run_curator_review with default synchronous=False.",
+      "file": "agent/curator.py",
+      "line": "940-944"
+    },
+    {
+      "claim": "The curator's LLM review pass constructs a NEW AIAgent object ('review_agent') in the same Python process/thread, not a subprocess.",
+      "evidence": "from run_agent import AIAgent; review_agent = AIAgent(model=model_name, provider=provider, ..., enabled_toolsets=['skills'], max_iterations=9999, quiet_mode=True, platform='curator', skip_context_files=True, skip_memory=True) -- a plain Python object construction inside _run_llm_review(), called from the daemon thread.",
+      "file": "agent/curator.py",
+      "line": "1013-1042"
+    },
+    {
+      "claim": "The curator's forked AIAgent is never given a session_db, so it has no SessionDB handle at all (agent._session_db stays None by default) and therefore cannot write to state.db.",
+      "evidence": "AIAgent.__init__ signature defaults session_db=None; the curator's AIAgent(...) call in _run_llm_review() does not pass session_db, so agent_init.py sets agent._session_db = session_db i.e. None. No session_id is passed either, so no session row exists for it to write into.",
+      "file": "run_agent.py",
+      "line": "264-267"
+    },
+    {
+      "claim": "Curator's idle-trigger entrypoint (maybe_run_curator) is called in-process from several call sites, none of which fork/exec a new process.",
+      "evidence": "Called from gateway/run.py _housekeeping_curator() (a scheduler-tick function), cli.py _tui_startup_background_maintenance(), and hermes_cli/web_server_sessions.py serve-mode tick -- all direct Python function calls, not subprocess.Popen/os.fork/multiprocessing.",
+      "file": "gateway/run.py",
+      "line": "4537-4540"
+    },
+    {
+      "claim": "background_review's post-turn auto-spawn is also a daemon thread inside the same process, not a subprocess.",
+      "evidence": "spawn_background_review_thread() returns a _target closure passed to threading.Thread(...) by the caller (AIAgent.run_conversation); _run_review_in_thread runs _run_review_fork which builds build_cache_parity_fork(agent, ...) -> AIAgent(**_fork_init_kwargs(...)), a plain object construction.",
+      "file": "agent/background_review.py",
+      "line": "1016-1030, 864-914"
+    },
+    {
+      "claim": "background_review's forked AIAgent explicitly nulls its SessionDB handle and disables persistence, specifically to prevent it writing into the shared session store while sharing the parent's session_id.",
+      "evidence": "review_agent._skip_mcp_refresh = review_agent._persist_disabled = review_agent.suppress_status_output = True; review_agent._end_session_on_close = False; review_agent._session_db = None; review_agent.session_id = agent.session_id -- comment: 'PERSISTENCE ISOLATION (curator-takeover root cause): sharing the parent's session_id, the fork would otherwise write its harness turn into the REAL session'.",
+      "file": "agent/background_review.py",
+      "line": "887-895"
+    },
+    {
+      "claim": "Usage/cost accounting for the background_review fork is deliberately routed through the PARENT's existing session_db handle only, never through a fork handle -- i.e. only the parent process ever writes for this feature, and only through its own already-owned handle.",
+      "evidence": "_record_review_usage_to_parent reads session_db = getattr(parent_agent, '_session_db', None) (the PARENT's handle) and calls session_db.record_auxiliary_usage(...); comment states 'The fork has _session_db = None so conversation_loop's DB-gated accounting never sees its calls'.",
+      "file": "agent/background_review.py",
+      "line": "721-737"
+    },
+    {
+      "claim": "A defense-in-depth exists in the session-store layer for the failure mode this isolation prevents (harness text leaking into the real session), confirming the isolation is intentional and previously fixed, not incidental.",
+      "evidence": "_strip_background_review_harness / _is_background_review_harness_message in hermes_state.py strip any stray background-review harness turn on read, and a dedicated test module documents the original bug this isolation fixed.",
+      "file": "tests/test_background_review_session_isolation.py",
+      "line": "1-13"
+    },
+    {
+      "claim": "The review_idle_queue (defer logic for the managed-local runtime) only delays WHEN the in-process thread is dispatched; dispatch is still the same in-process agent._spawn_background_review_now(**kwargs) call -- no subprocess is introduced by the idle-defer path either.",
+      "evidence": "item.agent._spawn_background_review_now(**item.kwargs) inside ReviewIdleQueue._run(), a plain method call on the already-live agent object from a dedicated bg-review-idle-queue daemon thread.",
+      "file": "agent/review_idle_queue.py",
+      "line": "141-160"
+    },
+    {
+      "claim": "DeletedWalGenerationError and the state.db generation/identity guard machinery exist in hermes_state.py to detect a real out-of-band file replacement or an actually-competing writer handle -- a different (and real) hazard class than the curator/background_review fork mechanism, since these forks never acquire a handle at all.",
+      "evidence": "hermes_state.py tracks self._db_file_identity, self._retired_generation_capture, _STATE_DB_GENERATION_KEY in a state_meta table, and raises DeletedWalGenerationError/StateDbReplacedError when a handle's view of the db file's identity/generation no longer matches -- this guards against genuinely separate SessionDB() instances (e.g. multiple OS processes, or a stray CLI invocation) opening the same physical state.db file, not against these two auto-review threads which hold no handle at all.",
+      "file": "hermes_state.py",
+      "line": "498-506, 1017-1116"
+    }
+  ],
+  "confidence": 0.8,
+  "recommended_action": "Rule out curator.enabled and agent.auxiliary.background_review.enabled as the direct cause of the recurring DeletedWalGenerationError: as implemented, both auto-triggers run in-process (daemon threads, not forked OS processes) and their forked AIAgent instances are explicitly given no SessionDB handle (session_db=None / _persist_disabled=True), so they cannot race the parent gateway's writer. Redirect the incident investigation to (a) any separate OS-process invocation of `hermes curator run` or a foreground `/refine` CLI session running concurrently with the gateway against the same ~/.hermes/state.db (a genuinely separate SessionDB() instance with its own generation/application_id bookkeeping), (b) other cron jobs or multiplexed profiles/gateway instances pointed at the same state.db, or (c) a WAL-incompatible filesystem (NFS/SMB/FUSE) noted in hermes_state.py's own hint text. If curator/background_review are still suspected, add a regression test asserting review-fork agents always have `_session_db is None` (or `_persist_disabled is True`) at spawn time so this isolation cannot silently regress."
+}

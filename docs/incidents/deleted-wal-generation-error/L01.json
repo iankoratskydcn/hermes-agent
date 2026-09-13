@@ -1,0 +1,68 @@
+{
+  "reviewer_id": "L01",
+  "verdict": "contributing_factor",
+  "findings": [
+    {
+      "claim": "DeletedWalGenerationError is raised from exactly two call sites: (1) the pre-connect guard refuse_deleted_wal_generation(), which fires when a /proc/*/fd scan finds ANY process (including this one) still holding an unlinked -wal/-shm inode for the path being opened; (2) the live-write guard _halt_if_db_generation_changed(), which fires when this SessionDB instance's own recorded WAL/SHM sidecar identity no longer matches what os.stat() currently reports at the path.",
+      "evidence": "refuse_deleted_wal_generation raises DeletedWalGenerationError iff iter_deleted_sqlite_sidecar_holders(db_path) is non-empty. _halt_if_db_generation_changed raises it iff self._db_wal_generation_lost or self._wal_generation_was_lost() is True (checked after the StateDbReplacedError branch).",
+      "file": "hermes_state_dbfile.py",
+      "line": "207-215"
+    },
+    {
+      "claim": "_wal_generation_was_lost() is a PURE (st_dev, st_ino) comparison against a per-instance snapshot taken at open time; it has no notion of which process or which SessionDB object created the new generation.",
+      "evidence": "recorded = self._db_sidecar_identity; if recorded: return any(_stat_db_file_identity(Path(base+suffix)) != ident for suffix, ident in recorded.items()). No check of who owns the new inode.",
+      "file": "hermes_state.py",
+      "line": "1076-1103"
+    },
+    {
+      "claim": "The per-instance recorded identity (self._db_sidecar_identity) is captured once at __init__ time via _record_db_file_identity(), and re-adopted only when the probe comes back 'clean' (no deleted holder found) -- it is never refreshed just because a SIBLING handle in the same process legitimately rotated the WAL.",
+      "evidence": "_record_db_file_identity(): self._db_sidecar_identity = _stat_sqlite_sidecar_identity(self.db_path) — called once from __init__ via _open_writer()/_record_db_file_identity() at line 537. Re-adoption of a fresh identity happens only inside _wal_generation_was_lost's 'probe clean' branch (lines 1099-1103), which runs only when self._db_sidecar_identity was already EMPTY, not when it is populated and merely stale.",
+      "file": "hermes_state.py",
+      "line": "1049-1052, 537, 1099-1103"
+    },
+    {
+      "claim": "_halt_if_db_generation_changed() (and thus DeletedWalGenerationError) is invoked on EVERY write through _raise_if_db_replaced(), which _execute_write() calls under self._lock before each BEGIN IMMEDIATE, and also from _reopen_after_close_locked() when a handle's own connection was closed out from under an in-flight caller.",
+      "evidence": "_raise_if_db_replaced(): if self._db_wal_generation_lost: raise DeletedWalGenerationError(...); else self._halt_if_db_generation_changed(). Called at hermes_state.py:881 inside _execute_write's `with self._lock:` block, and via _reopen_after_close_locked at line 833.",
+      "file": "hermes_state.py",
+      "line": "1151-1157, 881, 833"
+    },
+    {
+      "claim": "The comment block at _execute_write explicitly documents and defends against ONE same-process false-positive class: a single handle's own clean close() racing that SAME handle's write path, which used to misclassify the process's own close as an external deletion (#105567). This fix is scoped to intra-handle races under one instance's own self._lock, NOT to cross-handle (sibling SessionDB object) races on the same path.",
+      "evidence": "\"...misclassify this process's OWN clean close as an externally deleted generation, raising a sticky DeletedWalGenerationError that permanently refuses later writes (#105567). Inside the lock the probe only ever sees the stable post-close state...\" -- self._lock is a per-instance threading.Lock(), so this serialization has no effect across two different SessionDB Python objects on the same path.",
+      "file": "hermes_state.py",
+      "line": "868-877, 474"
+    },
+    {
+      "claim": "SQLite's WAL-mode close semantics documented in-code: a clean close() of the LAST live connection to a database causes SQLite to unlink (delete) the -wal/-shm sidecars, which is exactly the (st_dev, st_ino) transition _wal_generation_was_lost() detects as 'lost'. The comment treats this as a known, load-bearing SQLite behavior, not an anomaly.",
+      "evidence": "\"...close() cancels every POSIX advisory lock this process holds on the file...SQLite unlinks the -wal/-shm sidecars on a clean close.\" and close()'s own docstring: \"a full WAL reset races the gateway's live writer, tearing B-tree pages\" / \"Only a clean close ends the generation; retain the recorded identity when retiring an unsafe handle.\"",
+      "file": "hermes_state_dbfile.py, hermes_state.py",
+      "line": "64-68, 1395-1397"
+    },
+    {
+      "claim": "The codebase itself documents that multiple SessionDB() writer handles on ONE path, IN ONE PROCESS, is a real, previously-incident-causing pattern (#98573), and built a process-wide shared registry specifically so long-lived processes open only ONE writer connection per path -- implying redundant handles are known to cause correctness problems beyond fd exhaustion.",
+      "evidence": "\"Process-wide shared SessionDB registry: long-lived in-process callers share ONE writer connection per resolved path via hermes_state_registry.acquire(); one-shots use SessionDB() + close().\" and _PathReadBudget's docstring: \"A long-lived gateway holds at least two (SessionStore and GatewayRunner open independent handles per profile path) and the count grows with the profile count, which is how a healthy process walked into EMFILE -- #98573.\"",
+      "file": "hermes_state.py, hermes_state_readpool.py",
+      "line": "364-374, 146-151"
+    },
+    {
+      "claim": "hermes_state_readpool.py fires the EXACT log line from the incident report ('N live SessionDB handles on <path> in this process; each holds its own writer connection...') once per path when more than 4 (_HANDLES_PER_PATH_WARN) simultaneous SessionDB objects are registered against the same file, confirming the observed '5 live SessionDB handles' state is a normal, reachable condition when callers bypass the shared registry and call SessionDB() directly per subsystem.",
+      "evidence": "_HANDLES_PER_PATH_WARN = 4; register() warns when handles > _HANDLES_PER_PATH_WARN with message '%d live SessionDB handles on %s in this process; each holds its own writer connection (read connections are capped at %d for the file). A long-lived process should share one handle per path.'",
+      "file": "hermes_state_readpool.py",
+      "line": "46-48, 160-179"
+    },
+    {
+      "claim": "Each SessionDB writer handle opens its OWN sqlite3.Connection to the file (self._conn, opened once in _open_writer_conn/_connect_and_init and generally kept open for the handle's lifetime); SQLite's own last-connection-closes-WAL bookkeeping operates at the OS/shared-memory level across ALL connections to that file, independent of which Python object or which of the N sibling SessionDB handles owns each connection -- so a rotation triggered by one sibling's close()/reopen cycle is externally indistinguishable, from any OTHER sibling's point of view, from a foreign process deleting the WAL.",
+      "evidence": "_open_writer_conn() connects via _connect_tracked_db(str(self.db_path), ...) independently per SessionDB instance (no dedup against a sibling's connection on the same path); the generation guard (_wal_generation_was_lost) has no code path that consults hermes_state_readpool's per-path _PathReadBudget membership (i.e., 'do any of my siblings on this path still hold the OLD generation, or did one of them mint the NEW one') before concluding the generation was 'lost'.",
+      "file": "hermes_state.py",
+      "line": "653-677, 1076-1103"
+    },
+    {
+      "claim": "capture_retired_wal_generation()/refuse_deleted_wal_generation() DO account for same-process ownership at OPEN time (a live holder of a deleted WAL inode is tolerated if it is this process's own writer, since a new writer must not mint a replacement WAL out from under it) -- but this open-time carve-out has no counterpart in the live-write guard _wal_generation_was_lost(), which only compares stat identities and never asks 'is the new generation's owner one of my own siblings, and is that fine?'",
+      "evidence": "\"Includes this process: on the open/write refuse path the in-process writer holding the orphan inode must not mint a replacement WAL (_foreign_state_db_holders skips this PID).\" This asymmetry (open-time guard is process-identity-aware via _foreign_state_db_holders; write-time guard _wal_generation_was_lost is not) is the structural gap that lets a benign same-process WAL rotation trip the write-time guard.",
+      "file": "hermes_state_dbfile.py",
+      "line": "190-191"
+    }
+  ],
+  "confidence": 0.65,
+  "recommended_action": "Do not restart hermes-gateway/hermes-dashboard for this audit (per instructions). For remediation (separate lane): (1) audit all direct `SessionDB(...)` call sites in the live install and migrate long-lived, in-process callers (GatewayRunner, SessionStore, TUI server, dashboard routers) to hermes_state_registry.acquire()/release() so only ONE writer connection per resolved path exists per process -- this removes the sibling-rotation vector entirely; (2) as a smaller, more surgical fix, make _wal_generation_was_lost()/_halt_if_db_generation_changed() consult the per-path _PathReadBudget/_members registry (hermes_state_readpool.py) before concluding a generation change is foreign: if another live SessionDB *in this same process* already re-stamped/observed the new generation via _ensure_db_file_generation's state_meta token or _db_file_application_id, treat it as an in-process rotation (log + silently adopt the new identity) instead of raising DeletedWalGenerationError. Cannot be fully confirmed without either (a) a controlled reproduction opening 5 concurrent SessionDB() writer handles on one path under real SQLite auto-checkpoint/close-time WAL deletion and observing the exact log/traceback, or (b) inspecting the actual retired-wal-generation manifest.json artifacts already captured on this host (should exist under state.db.retired-wal-<ts>-<pid>/ per capture_retired_wal_generation) to see whether the recorded 'foreign' pid in each incident was in fact this same process's own earlier PID/handle."
+}

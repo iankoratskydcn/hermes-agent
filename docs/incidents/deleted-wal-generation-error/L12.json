@@ -1,0 +1,44 @@
+{
+  "reviewer_id": "L12",
+  "verdict": "concern",
+  "findings": [
+    {
+      "claim": "Only two live PIDs currently hold /proc/<pid>/fd handles on state.db or its sidecars: PID 1144279 (hermes-dashboard.service, cmdline '/home/ian-koratsky/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main dashboard --host 100.64.44.31 --port 9119 --no-open', PPID 6756=systemd --user, 1 fd on state.db, no deleted inodes) and PID 1146135 (hermes-gateway.service, cmdline 'python -m hermes_cli.main gateway run', PPID 6756, 10 fds total on state.db/state.db-wal/state.db-shm, 3 of which point at deleted inodes for state.db-wal and 1 deleted state.db-shm).",
+      "evidence": "Full /proc/<pid>/fd scan across all PIDs in /proc; ps -ef confirmed cmdlines and PPIDs.",
+      "file": "n/a (runtime observation)",
+      "line": "n/a"
+    },
+    {
+      "claim": "Both live fd-holding PIDs are systemd-user-managed: `systemctl --user show hermes-gateway.service -p MainPID` = 1146135 and `hermes-dashboard.service` MainPID = 1144279, matching exactly the two PIDs found holding state.db fds; both ActiveState=active/SubState=running. No orphan/manual process currently holds an fd on state.db*.",
+      "evidence": "systemctl --user show hermes-gateway.service -p MainPID,ActiveState,SubState and same for hermes-dashboard.service.",
+      "file": "n/a (runtime observation)",
+      "line": "n/a"
+    },
+    {
+      "claim": "A separate, NOT systemd-managed 'hermes' CLI process tree is running on this host: PID 1139237 ('/home/ian-koratsky/.hermes/hermes-agent/venv/bin/python /home/ian-koratsky/.hermes/hermes-agent/hermes'), PPID 1135215 (a shell on pts/6), started 07:22, with two children (1139267 decision-hud MCP plugin, 1139269 mcp_death_supervisor). This process currently has no fd open on state.db (not present in the fd scan), but it is a manual/interactive instance separate from the two systemd services and is a candidate secondary writer to state.db when active, since it runs the same hermes-agent codebase against the same ~/.hermes/state.db.",
+      "evidence": "ps --ppid and ps -ef output showing PID 1139237 tree; absence from the /proc fd scan for state.db.",
+      "file": "n/a (runtime observation)",
+      "line": "n/a"
+    },
+    {
+      "claim": "journalctl shows exactly one systemd-visible restart of hermes-gateway.service in the last 30 minutes, at 07:47:57-07:47:58: SIGTERM was delivered by systemd (parent_pid=6756, parent_name=systemd), the shutdown path hit the WAL quarantine code path ('Skipping the close-time WAL checkpoint ... this handle's WAL/SHM generation was deleted or replaced'), the old process exited with status=1/FAILURE, and systemd immediately restarted it as the new MainPID 1146135. This produced retired-WAL capture directory state.db.retired-wal-20260913-114757-1144278 (captured by PID 1144278, i.e. the gateway process just before its final exit).",
+      "evidence": "journalctl --user -u hermes-gateway.service -u hermes-dashboard.service --since '-30 min' --no-pager, grep for Stopping/Stopped/Started/Main process exited/Failed/retired; ls of /home/ian-koratsky/.hermes/state.db.retired-wal-20260913-114757-1144278.",
+      "file": "n/a (runtime observation)",
+      "line": "n/a"
+    },
+    {
+      "claim": "A SECOND, later WAL-quarantine event occurred at 07:59:17 (state.db.retired-wal-20260913-115917-1146711/manifest.json, trigger='halt') attributed to PID 1146711 -- a PID that does NOT match either current systemd MainPID (1146135 gateway, 1144279 dashboard) and is not present anywhere in the current `ps -ef` output. This PID is unaccounted for: it is not a currently-running process, not the gateway's or dashboard's tracked MainPID, and journalctl for hermes-gateway.service/hermes-dashboard.service in the same window shows NO corresponding systemd Stopping/Started cycle at 07:59 (the only systemd-visible restart in the window was the 07:47:57 one). This strongly suggests an untracked/orphan process (possibly a leftover child, a manually-invoked hermes subcommand, or a race during the 07:47 restart) also opened a write handle on state.db around 07:48-07:59, hit the same WAL-generation-deleted condition, and quarantined its connection independently of the systemd-managed services -- i.e. a second, unmonitored writer contending for the same database file during the incident window.",
+      "evidence": "ls -la /home/ian-koratsky/.hermes/ | grep retired-wal (two capture dirs); cat of state.db.retired-wal-20260913-115917-1146711/manifest.json showing pid=1146711, trigger=halt; journalctl grep for Stopping/Started showing only one systemd-visible cycle at 07:47:57-58, none at 07:59.",
+      "file": "n/a (runtime observation)",
+      "line": "n/a"
+    },
+    {
+      "claim": "No crash loop is visible in journalctl for hermes-gateway.service/hermes-dashboard.service in the last 30 minutes beyond the single 07:47:57 stop/restart cycle; hermes-dashboard.service shows no restart at all in the window (still on original MainPID 1144279 since 07:36). Post-restart gateway logs (07:48:03 onward) show normal startup warnings (tool check_fn gating, worktree size notices) with no further failures through the present.",
+      "evidence": "journalctl --user -u hermes-gateway.service -u hermes-dashboard.service --since '-30 min' --no-pager, full 37-line output reviewed; systemctl --user show confirms MainPID for dashboard unchanged at 1144279.",
+      "file": "n/a (runtime observation)",
+      "line": "n/a"
+    }
+  ],
+  "confidence": 0.75,
+  "recommended_action": "Do not restart or kill anything (per read-only constraint). Identify what process 1146711 was (check auditd/process-accounting logs, shell history, or any cron/timer around 07:48-07:59) since it is an untracked writer that quarantined its own WAL generation outside systemd's visibility -- this is the most likely direct cause of the recurring DeletedWalGenerationError alongside the systemd-triggered gateway restart at 07:47:57. Also audit the manual 'hermes' CLI process tree (PID 1139237, started 07:22 on pts/6, not systemd-managed) as a standing secondary writer against the same state.db; if it is expected to run long-term alongside the systemd services, ensure all three consumers use compatible WAL/locking discipline or route through a single writer. Before doing anything with the two retired-wal capture directories, inspect both manifest.json files and run `hermes sessions recover --inspect-only` as the warning logs instruct, rather than deleting or merging them manually."
+}

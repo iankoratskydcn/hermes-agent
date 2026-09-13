@@ -1,0 +1,38 @@
+{
+  "reviewer_id": "L11",
+  "verdict": "mechanism traced; no open TODO/known-issue markers found for the WAL-generation guard — prior false-positive bug (#105567) was already fixed upstream, but the underlying condition it guards against (an externally deleted/replaced WAL generation, i.e. split-brain) is a real, expected trigger, not a known-false-positive bug class",
+  "findings": [
+    {
+      "claim": "DeletedWalGenerationError and the generation-guard mechanism were introduced across a cluster of commits fixing issue #105670, starting with capturing a lost WAL generation durably at shutdown.",
+      "evidence": "git log -S 'DeletedWalGenerationError' shows: d616424571 'fix(sessions): capture a lost WAL generation durably before shutdown settles', 64fe13a647 'fix(sessions): retire-capture integrity', 031d3760d0 'fix(state): distinguish retired WAL recovery guidance'. Related commit 68d9365aa7 'fix(state): guard close-time checkpoint for replaced/deleted-generation handles (#105670)' and hermes_state_maintenance.py:344 cite #105670 directly.",
+      "file": "hermes_state.py / hermes_state_maintenance.py / hermes_state_dbfile.py",
+      "line": "hermes_state.py:1290-1297 (_quarantine_reason); hermes_state_maintenance.py:344; hermes_state_dbfile.py:221"
+    },
+    {
+      "claim": "Issue #105670 is the root incident: a close-time WAL checkpoint could run against a replaced/deleted-generation handle and checkpoint under the wrong page numbers into the main DB, corrupting state.db.",
+      "evidence": "hermes_state.py:1288-1290 comment: 'a replaced file or a deleted/replaced WAL generation would checkpoint under wrong page numbers into the main DB -- the shutdown-time cause of #105670.'",
+      "file": "hermes_state.py",
+      "line": "1288-1290"
+    },
+    {
+      "claim": "A known false-positive bug in the original guard WAS identified and IS already fixed on main: a lock-free probe racing close() could misclassify the process's own clean shutdown as an externally-deleted WAL generation, raising a permanently-sticky DeletedWalGenerationError.",
+      "evidence": "hermes_state.py:871-877 comment: '...can observe the mid-teardown state ... and misclassify this process's OWN clean close as an externally deleted generation, raising a sticky DeletedWalGenerationError that permanently refuses later writes (#105567). Inside the lock the probe only ever sees the stable post-close state.' Fixed by commit 3a3ec6eeaf 'fix(state): serialize replaced/generation probe with close() in _execute_write'.",
+      "file": "hermes_state.py",
+      "line": "871-878 (near _execute_write, the replaced/generation probe is now taken inside self._lock)"
+    },
+    {
+      "claim": "No open TODO, FIXME, or 'known issue' comments remain in hermes_state*.py acknowledging incomplete handling of the WAL-generation guard; the only '#1xxxxx' issue references in these files are explanatory citations to ALREADY-FIXED/landed commits (design rationale comments), not outstanding work markers.",
+      "evidence": "Regex search for TODO|FIXME|known issue near wal|generation across hermes_state*.py returned 0 matches. A broader scan of '#10[0-9]{4}' references (e.g. #105670, #105567, #100436, #100108, #103840, #105790, #106393) in hermes_state_dbfile.py, hermes_state.py, hermes_state_maintenance.py, hermes_state_repair.py, hermes_state_schema.py all point to issue numbers with corresponding fix commits already merged on this branch, used as design/rationale comments rather than TODOs.",
+      "file": "hermes_state_errors.py / hermes_state.py / hermes_state_dbfile.py / hermes_state_maintenance.py",
+      "line": "hermes_state_errors.py:155-163 (class DeletedWalGenerationError docstring, no TODO); search output across all hermes_state*.py"
+    },
+    {
+      "claim": "Further refinement commits continued hardening the guard after #105670/#105567, including a subtly different incident class (#106393-style transient peer waits) and most recently distinguishing operator-facing recovery guidance for retired-WAL vs plain-replaced-file cases.",
+      "evidence": "Commit chain from git log --grep WAL -i: 68d9365aa7 (#105670), 3a3ec6eeaf (close-race fix, #105567 rationale), d93f72c460 'retire lost-generation writers unclosed where the close-time checkpoint cannot be switched off', 6ac77111af 'refactor(sessions): simplify the retired-generation capture after review', 6db572a828 'test(hermes_state): one harness for the lost-WAL-generation tests', 031d3760d0 'fix(state): distinguish retired WAL recovery guidance' (most recent, Sep 11 2026).",
+      "file": "git history",
+      "line": "commits 68d9365aa7, 3a3ec6eeaf, d93f72c460, 6ac77111af, 6db572a828, 031d3760d0"
+    }
+  ],
+  "confidence": 0.75,
+  "recommended_action": "If DeletedWalGenerationError is recurring in production despite the #105567 close-race fix (3a3ec6eeaf) and the #105670 checkpoint guard (68d9365aa7) already being on main, treat it as a genuine split-brain signal (an external process, backup/restore, or filesystem op actually deleted/replaced the -wal/-shm sidecars under a live writer) rather than assume another latent false-positive. Confirm the production install's commit includes 3a3ec6eeaf and 031d3760d0; if not, upgrading likely resolves it. If already current, pull the captured-generation manifest referenced by the 031d3760d0 recovery guidance and check hermes_state_holders / _foreign_state_db_holders for an actual competing process (e.g. a second instance, a backup tool, or a container restart unlinking sidecars) before touching state.db manually — per the guard's own docstring, never unlink the WAL yourself."
+}

@@ -1,0 +1,43 @@
+{
+  "reviewer_id": "L04",
+  "verdict": "confirmed_risk",
+  "findings": [
+    {
+      "claim": "POST /api/sessions/owner-backfill is owned by hermes_cli/web_routers/sessions.py, handler backfill_session_owner_profiles, which opens a per-request writable SessionDB handle via _with_db -> _open_session_db_for_profile(profile, read_only=False).",
+      "evidence": "manage_router.post(\"/api/sessions/owner-backfill\") at line 582 calls `await asyncio.to_thread(_with_db, body.profile, lambda db: db.backfill_null_session_profiles(stamp), read_only=False)`; `_with_db` (line 130) opens via `_open_session_db_for_profile`, runs fn, then always calls `db.close()` in a finally block. So the handle is opened and closed PER REQUEST, not held across requests.",
+      "file": "hermes_cli/web_routers/sessions.py",
+      "line": 582
+    },
+    {
+      "claim": "The per-request open/close routes through a process-local shared-registry singleton (hermes_state_registry), not a fresh raw sqlite3 connection each time.",
+      "evidence": "_open_session_db_for_profile -> _open_session_db_at_path (hermes_state_dbfile.py:194-199) calls `acquire(db_path)` from hermes_state_registry for the read_only=False (write) path, and `db.close()` in the router routes to the registry's `release()`/refcount-decrement, which only physically tears down the connection on the LAST reference for that path within THIS process.",
+      "file": "hermes_state_dbfile.py",
+      "line": 119
+    },
+    {
+      "claim": "hermes_state_registry.py explicitly documents itself as a PER-PROCESS boundary: 'one shared SessionDB per resolved path per process'. It has no cross-process mutex — its locks (_lock, _tearing_down, _path_lifecycle_locks) are Python threading.Lock/Event objects, which cannot coordinate across separate OS processes.",
+      "evidence": "Module docstring lines 1-29: 'This module owns that boundary: one shared SessionDB per resolved path per process, refcounted, with generation-aware retirement when the file is replaced.' All synchronization primitives (_lock, _opening, _tearing_down, _path_lifecycle_locks) are `threading.Lock`/`threading.Event`, in-memory to one interpreter/process.",
+      "file": "hermes_state_registry.py",
+      "line": 1
+    },
+    {
+      "claim": "The gateway process (hermes-gateway.service) independently calls the SAME hermes_state_registry.acquire() on the same state.db path, e.g. gateway/mirror.py and gateway/run.py's _open_session_db_for_active_scope, confirming dashboard and gateway are two separate OS processes each running their OWN in-process registry singleton against the same physical file.",
+      "evidence": "gateway/mirror.py:77-78 `from hermes_state_registry import acquire, release_or_close; db = acquire()`; gateway/run.py:3709-3727 `_open_session_db_for_active_scope` also imports `hermes_state_registry.acquire`. Since hermes-dashboard.service and hermes-gateway.service are separate systemd units (separate PIDs), each has an independent module-level `_generations`/`_lock` registry state; there is no shared cross-process coordinator for state.db writer connections.",
+      "file": "gateway/run.py",
+      "line": 3727
+    },
+    {
+      "claim": "The codebase has a dedicated detection/quarantine mechanism (DeletedWalGenerationError, refuse_deleted_wal_generation, iter_deleted_sqlite_sidecar_holders which scans ALL processes' /proc fd tables) specifically because a WAL/SHM generation can be deleted or replaced underneath a still-open handle held by a DIFFERENT process -- this is acknowledged as a known cross-process race, not merely a same-process race.",
+      "evidence": "hermes_state_dbfile.py:207-215 `refuse_deleted_wal_generation` is called 'before sqlite3.connect() so a second opener cannot mint a replacement WAL inode' and scans `_iter_proc_fd_targets()` across the whole /proc tree (not just this process's fds) for '(deleted)' WAL/SHM markers. hermes_state.py:1130-1157 documents the sticky `_db_wal_generation_lost` flag and the comment 'the canonical DeletedWalGenerationError remediation is to stop the writers' (plural, implying multiple writer processes).",
+      "file": "hermes_state_dbfile.py",
+      "line": 207
+    },
+    {
+      "claim": "Recurrence shortly after a clean restart with no operator interference is consistent with a startup race: hermes-dashboard.service and hermes-gateway.service starting close together, each independently opening/closing writer handles (including close-time WAL checkpoint + potential WAL/SHM unlink-and-recreate in the registry teardown path) on the same state.db, so one process's teardown can retire/replace the WAL generation while the other process's handle -- opened moments earlier and used later by owner-backfill's per-request _with_db call -- still points at the old generation, tripping DeletedWalGenerationError on its next write probe (_raise_if_db_replaced / _halt_if_db_generation_changed).",
+      "file": "hermes_state.py",
+      "line": 1151
+    }
+  ],
+  "confidence": 0.75,
+  "recommended_action": "Escalate to design review: confirm whether hermes_state_registry's per-process, refcounted, generation-aware SessionDB sharing was ever intended to be safe when TWO SEPARATE OS PROCESSES (hermes-dashboard.service and hermes-gateway.service) hold independent registry instances against the same state.db in WAL mode simultaneously. If cross-process concurrent writers were intended to be safe, add cross-process coordination (e.g. an OS-level advisory lock or single-writer arbitration, not just SQLite's own WAL locking) around checkpoint/teardown; if the dashboard is meant to be read-mostly, audit remaining write-path routes (owner-backfill, prune, import, delete) in hermes_cli/web_routers/sessions.py for cases that could instead proxy writes through the gateway process rather than opening an independent writer connection. Do not restart live services as part of this triage; reproduce with two throwaway processes acquiring the same test state.db concurrently to confirm the exact interleaving before changing production code."
+}

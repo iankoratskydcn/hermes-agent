@@ -1,0 +1,38 @@
+{
+  "reviewer_id": "L16",
+  "verdict": "Intentional fail-closed behavior, not an auto-recovery gap",
+  "findings": [
+    {
+      "claim": "The repository has automatic detection and durable capture of a deleted/replaced WAL generation, but not transparent reopen against the generation currently at the path.",
+      "evidence": "_wal_generation_was_lost() compares recorded WAL/SHM identities and, when needed, scans this process's descriptors for deleted sidecars. _halt_if_db_generation_changed() marks the handle sticky, disables close-time checkpointing, and invokes _capture_retired_generation('halt'). capture_retired_wal_generation() locates the exact WAL by inode and writes a durable artifact and manifest; it explicitly says nothing is merged and disposition is an operator decision.",
+      "file": "hermes_state.py; hermes_state_dbfile.py",
+      "line": 1076
+    },
+    {
+      "claim": "DeletedWalGenerationError requires a service restart because the live SessionDB handle is deliberately made permanently unusable for writes, and the documented remediation is to stop all writers and reopen.",
+      "evidence": "_raise_if_db_replaced() immediately re-raises when _db_wal_generation_lost is sticky. _halt_if_db_generation_changed() raises DeletedWalGenerationError after capture. The error message says to stop gateway, dashboard, and cron writers before reopening; it refuses opening/writing specifically to prevent minting a second WAL inode. The turn explanation likewise instructs operators to stop writers, inspect the retired artifact manifest, and decide whether frames belong on the current database.",
+      "file": "hermes_state.py; hermes_state_errors.py; agent/turn_explainers.py",
+      "line": 1151
+    },
+    {
+      "claim": "The existing automatic reopen path is narrowly scoped to a close()/worker teardown race and is explicitly not a generation-recovery path.",
+      "evidence": "_reopen_after_close_locked() is documented as reopening only after an explicit close() raced a live caller. Before reopening it calls _halt_if_db_generation_changed(), so a replaced file or lost WAL generation is rejected rather than reopened. The implementation opens a fresh writer connection only after that guard passes.",
+      "file": "hermes_state.py",
+      "line": 815
+    },
+    {
+      "claim": "This safety choice is justified: blindly reopening can combine a retired WAL's committed frames with a newer or missing main/sidecar generation, causing split-brain, wrong-page checkpointing, corruption, or data loss.",
+      "evidence": "hermes_state_dbfile.py states that a second opener would mint a fresh WAL and produce intermittent SQLITE_CORRUPT/IOERR, and that quarantine prevents retired frames from being checkpointed under wrong page numbers. hermes_state_errors.py describes the same split-brain hazard and requires stopping writers; the capture code refuses pathname-based guessing and preserves bytes without merging.",
+      "file": "hermes_state_dbfile.py; hermes_state_errors.py",
+      "line": 1
+    },
+    {
+      "claim": "The quarantine_cross_process_lock and quarantine_invalid_state_db functions address invalid main-file startup state, not deleted-WAL generation recovery.",
+      "evidence": "quarantine_cross_process_lock() serializes path.quarantine.lock. quarantine_invalid_state_db() only checks for a missing/invalid SQLite header, renames the invalid state.db and sidecars aside, and permits a fresh startup database. Deleted-WAL protection occurs separately in refuse_deleted_wal_generation() before sqlite3.connect and in the live generation probes.",
+      "file": "hermes_state_dbfile.py",
+      "line": 477
+    }
+  ],
+  "confidence": 0.98,
+  "recommended_action": "Keep the fail-closed/manual-restart boundary. Improve operator automation around it rather than transparently reopening: stop or fence all gateway/dashboard/cron writers, verify the retired artifact manifest and current generation, then provide an explicit recovery/reopen command that requires an operator decision about merging or discarding captured frames. Do not auto-merge or reopen solely because a new generation exists."
+}

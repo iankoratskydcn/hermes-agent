@@ -1,0 +1,44 @@
+{
+  "reviewer_id": "L14",
+  "verdict": "Not a bug in the generation guard itself. The transition the guard reacts to is a legitimate, documented SQLite behavior — the last-connection close-time checkpoint unlinks the -wal/-shm sidecars — not a PRAGMA wal_checkpoint truncate. This is distinct from the periodic in-process PASSIVE checkpoint, which never deletes anything (correctly restricted to a no-op-on-delete truncate). When DeletedWalGenerationError fires because a DIFFERENT live process's clean close deleted the sidecars while this handle still records the old generation identity, the guard is correctly detecting a genuine multi-writer hazard (a second opener would mint a split-brain WAL inode) and refusing is the right behavior. The one known false-positive form (a handle misclassifying its OWN clean close as an externally deleted generation) was already fixed by moving the live probe inside the connection lock so it only observes the stable post-close state (tracked as #105567); no code in the current hermes_state* files unlinks a live, actively-shared -wal/-shm outside of that documented SQLite close-time path or off-line scratch/backup files.",
+  "findings": [
+    {
+      "claim": "SQLite itself unlinks -wal/-shm when the LAST connection closes in WAL mode (documented SQLite behavior, not attacker/operator action); this codebase relies on Connection.setconfig(SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE) to suppress it only in the quarantine (corruption) path, so normal clean closes of transient handles legitimately delete the sidecars and change the generation for any other live opener.",
+      "evidence": "\"SQLite still runs its own last-connection checkpoint inside close() (and deletes the -wal sidecar) unless SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE is set\" -- StateDbCorruptError docstring explains the close()-time checkpoint deletes -wal, and quarantine specifically disables it (3.12+) to preserve forensics; outside quarantine this deletion runs normally.",
+      "file": "hermes_state_errors.py",
+      "line": "195-200"
+    },
+    {
+      "claim": "The codebase already identified and fixed the exact false-positive this incident is about: a handle's own clean close (which legitimately unlinks its -wal/-shm as part of SQLite's normal last-connection checkpoint) was being raced by a lock-free generation probe and misread as an externally deleted generation, permanently sticking DeletedWalGenerationError on writes.",
+      "evidence": "\"close() mutates _conn and _db_sidecar_identity under that same lock, ending the WAL generation (SQLite unlinks the -wal/-shm sidecars on a clean close). A lock-free probe that races close() can observe the mid-teardown state ... and misclassify this process's OWN clean close as an externally deleted generation, raising a sticky DeletedWalGenerationError that permanently refuses later writes (#105567). Inside the lock the probe only ever sees the stable post-close state.\"",
+      "file": "hermes_state.py",
+      "line": "868-877"
+    },
+    {
+      "claim": "Periodic in-band checkpointing used during normal writes is PASSIVE and explicitly chosen to avoid ever truncating/deleting the WAL out from under concurrent writers -- confirming normal PRAGMA wal_checkpoint traffic in this codebase does NOT delete/replace the sidecar, matching the task's premise; only the close-time last-connection path does.",
+      "evidence": "\"Every cron run_agent opens+closes a transient SessionDB, so a TRUNCATE here fires a full WAL reset many times/hour, racing the gateway's long-lived writer on large WAL databases and tearing hot B-tree pages -- the #45383 corruption this class's own periodic checkpoint was already made PASSIVE to avoid. TRUNCATE belongs only on a sole-opener/quiescent connection.\"",
+      "file": "hermes_state.py",
+      "line": "1379-1388"
+    },
+    {
+      "claim": "The frequent legitimate trigger for the generation actually changing underneath a live long-running handle (e.g. the gateway) is exactly the pattern flagged above: many short-lived cron/transient SessionDB opens close cleanly and each close is a 'last connection' event that runs SQLite's own checkpoint+unlink of -wal/-shm, minting a new generation each time -- a real multi-writer topology, not an attacker deleting files.",
+      "evidence": "Comment explicitly frames the risk in terms of \"Every cron run_agent opens+closes a transient SessionDB\" causing frequent full WAL resets/generation changes that race the gateway's long-lived writer.",
+      "file": "hermes_state.py",
+      "line": "1381-1385"
+    },
+    {
+      "claim": "refuse_deleted_wal_generation()/iter_deleted_sqlite_sidecar_holders() detect deleted-but-still-open sidecar inodes via /proc fd scanning before a fresh sqlite3.connect(), which is the correct fail-closed response to a genuine split-brain hazard (two processes each holding a different unlinked WAL generation for the same path) rather than a bug -- it deliberately does not distinguish 'my own past close' from 'another process's close' at this call site, relying on the earlier in-lock fix to prevent self-misclassification before this guard is ever reached.",
+      "evidence": "\"Raise if any process holds a deleted WAL/SHM generation for db_path; called before sqlite3.connect so a second opener cannot mint a replacement WAL inode.\" and \"Includes this process: on the open/write refuse path the in-process writer holding the orphan inode must not mint a replacement WAL.\"",
+      "file": "hermes_state_dbfile.py",
+      "line": "187-215"
+    },
+    {
+      "claim": "The repair/backup paths (_unlink_db_triple, forensic backup pruning, VACUUM INTO) only ever delete or create sidecars for scratch/staging copies or explicit forensic backup files, never for the live shared state.db path outside an exclusive-writer guard, so they are not the source of a generation change observed by an unrelated live reader/writer.",
+      "evidence": "\"Never leave a half-repaired file beside the DB to be mistaken for the real thing\" -- _unlink_db_triple is called only on `scratch` (a staged repair copy) inside the exclusive `_exclusive_repair_db_guard` block, and VACUUM INTO targets a separate `backup_path`, never db_path itself.",
+      "file": "hermes_state_repair.py",
+      "line": "1010-1043"
+    }
+  ],
+  "confidence": 0.72,
+  "recommended_action": "Treat DeletedWalGenerationError as correctly firing by design when it is triggered by a genuinely different process's close-time WAL deletion (the multi-writer/cron-transient-handle race documented at hermes_state.py:1381-1385) -- that is the real hazard the guard exists for and should not be relaxed. Confirm the #105567 in-lock-probe fix is actually deployed in the reported incident's build (git blame/version check), since an incident predating that fix would be the same already-diagnosed self-misclassification bug, not a new one. If the fix is present and the error still recurs, instrument iter_deleted_sqlite_sidecar_holders() to log the PIDs/argv of the holder(s) found, to confirm whether the holder is truly a separate process (real race, correct refusal) versus this same PID re-appearing outside the lock window (residual race requiring a narrower fix, e.g. widening the locked region around _reopen_after_close_locked or the initial connect-time probe in refuse_deleted_wal_generation)."
+}

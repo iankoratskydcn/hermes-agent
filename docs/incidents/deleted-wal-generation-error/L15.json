@@ -1,0 +1,44 @@
+{
+  "reviewer_id": "L15",
+  "verdict": "not_a_contributing_factor: fd limits and filesystem are fine; deleted-inode fds are real but reproduced on plain local ext4 well within limits, pointing to an application-level WAL unlink/reopen race rather than resource exhaustion or exotic filesystem semantics",
+  "findings": [
+    {
+      "claim": "ulimit -n on the shell is 1024, but the actual running gateway process (pid 1146135) has Max open files soft=4096 which matches config.yaml runtime.nofile_soft_limit:4096 exactly, and hard=524288",
+      "evidence": "shell `ulimit -n` = 1024; `/proc/1146135/limits` shows 'Max open files 4096 524288 files'; config.yaml line 18 sets nofile_soft_limit: 4096",
+      "file": "~/.hermes/config.yaml",
+      "line": "18"
+    },
+    {
+      "claim": "The gateway is nowhere near its fd limit, so file-descriptor exhaustion is not a plausible contributing cause of DeletedWalGenerationError",
+      "evidence": "`ls /proc/1146135/fd | wc -l` = 30 total open fds vs a soft limit of 4096 (0.7% utilization)",
+      "file": "n/a (runtime)",
+      "line": "n/a (runtime)"
+    },
+    {
+      "claim": "Deleted-but-still-open fds for state.db-wal and state.db-shm are already present only ~16 minutes after a fresh systemd restart, confirming the incident's timing description",
+      "evidence": "systemd shows 'Active: active (running) since Sun 2026-09-13 07:47:58 EDT; 16min ago'; `ls -la /proc/1146135/fd` shows fd 10 -> state.db-wal (deleted), fd 11 -> state.db-shm (deleted), fd 24 -> state.db-wal (deleted), fd 30 -> state.db-wal (deleted) — i.e. THREE separate deleted state.db-wal fds plus one deleted state.db-shm fd coexisting simultaneously on the same live process",
+      "file": "n/a (runtime, /proc/1146135/fd)",
+      "line": "n/a (runtime)"
+    },
+    {
+      "claim": "~/.hermes (and state.db) is backed by a plain local ext4 filesystem on the root disk, not a network mount, FUSE mount, overlayfs, Docker volume, bind mount, or WSL/9p mount",
+      "evidence": "`df -h ~/.hermes` -> /dev/sda4 mounted at /, 1023G ext4; `stat -f ~/.hermes` reports Type: ext2/ext3 (ext4 reports as this family) with normal local block/inode counts; `findmnt -T ~/.hermes` confirms SOURCE=/dev/sda4 FSTYPE=ext4 OPTIONS=rw,relatime; /proc/self/mountinfo entry for '/' shows '8:4 / / rw,relatime shared:1 - ext4 /dev/sda4 rw' with no overlay/fuse/nfs/cifs/9p markers",
+      "file": "n/a (runtime)",
+      "line": "n/a (runtime)"
+    },
+    {
+      "claim": "No Docker, container, or WSL context is involved; the gateway process shares the host mount namespace and there is no 9p/WSL indicator",
+      "evidence": "/proc/version shows a native Ubuntu kernel '7.0.0-31-generic ... SMP PREEMPT_DYNAMIC' with no 'microsoft' string; /.dockerenv absent; /proc/1146135/cgroup shows a plain user systemd slice path ('/user.slice/user-1000.slice/user@1000.service/app.slice/hermes-gateway.service'), not a docker/containerd cgroup; readlink of /proc/1146135/ns/mnt and /proc/self/ns/mnt are identical (mnt:[4026531832]), meaning the gateway is not in a separate mount namespace (rules out an isolated container/bind-mount view of ~/.hermes)",
+      "file": "n/a (runtime)",
+      "line": "n/a (runtime)"
+    },
+    {
+      "claim": "Given plain local ext4 with a shared mount namespace, POSIX unlink-while-open semantics (the deleted-but-still-referenced inode staying valid until all fds close) are fully honored by the kernel here; ext4 is not one of the filesystems (NFS, some FUSE backends, overlayfs corner cases, 9p) known to break that guarantee",
+      "evidence": "stat/findmnt/mountinfo all agree the filesystem is native ext4 on a local block device (/dev/sda4); no overlay, fuse, nfs, cifs, or 9p entries anywhere in /proc/self/mountinfo relevant to /home path",
+      "file": "n/a (runtime)",
+      "line": "n/a (runtime)"
+    }
+  ],
+  "confidence": 0.85,
+  "recommended_action": "Rule out ulimit/nofile and filesystem-type as root causes of DeletedWalGenerationError -- both check out clean (fd usage 30/4096, filesystem is plain local ext4 with correct unlink-while-open semantics, no container/WSL/network-mount confusion). Redirect the investigation to application-level WAL lifecycle: something in the SQLite WAL checkpoint/rotation path is unlinking state.db-wal and state.db-shm while a live connection/cursor still holds an fd open, and doing so repeatedly (3 stale state.db-wal fds observed simultaneously 16 minutes after a clean restart). Look at hermes_state.py / hermes_state_*.py WAL checkpoint and any code path that deletes/recreates the -wal/-shm files directly instead of going through sqlite3's own checkpoint/close API, and check for multiple concurrent SQLite connections/processes opening the same state.db without proper WAL-mode coordination (e.g. a second process or thread also opening state.db and racing a checkpoint against the main gateway connection)."
+}

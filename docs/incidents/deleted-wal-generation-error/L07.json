@@ -1,0 +1,38 @@
+{
+  "reviewer_id": "L07",
+  "verdict": "acp_adapter not currently live; its SessionDB usage pattern is process-lifetime-scoped (one handle per ACP server process, not per-session/per-request), so it is architecturally a low-frequency, plausible-but-unlikely contributor to WAL churn -- ruled out as active cause right now since no ACP process is running.",
+  "findings": [
+    {
+      "claim": "SessionManager.__init__ takes an optional db param but defaults to lazy init (_db_instance=None); _get_db() creates the SessionDB exactly once per SessionManager instance and caches it, not per-session or per-request.",
+      "evidence": "_get_db() checks `if self._db_instance is None:` before constructing `SessionDB(db_path=get_hermes_home() / 'state.db')`, then returns the cached `self._db_instance` on every subsequent call from `_persist()` and `_restore()`.",
+      "file": "acp_adapter/session.py",
+      "line": "268"
+    },
+    {
+      "claim": "SessionManager itself is instantiated once per ACP server process (in server.py's constructor), so there is exactly one long-lived SessionDB handle per running ACP adapter process, reused across all editor sessions/requests handled by that process -- not fresh handles per session.",
+      "evidence": "`self.session_manager = session_manager or SessionManager()` in the ACP server's __init__; no other call site constructs SessionManager per-request.",
+      "file": "acp_adapter/server.py",
+      "line": "249"
+    },
+    {
+      "claim": "Writes to state.db from ACP happen on meaningful lifecycle events (session create, prompt completion, cwd update, model switch), not on every message/tick, via `_persist()` -> `db.create_session`/`db.update_session_meta`/`db.replace_messages`.",
+      "evidence": "`save_session()` docstring: 'called by the server after prompt completion, history-mutating slash commands, and model switches'; `_persist()` performs create_session or update_session_meta then replace_messages (or skips replace when the agent self-persists incrementally).",
+      "file": "acp_adapter/session.py",
+      "line": "246"
+    },
+    {
+      "claim": "No ACP adapter process was running on the host at investigation time; only CLI (hermes), dashboard, and gateway processes held state.db open.",
+      "evidence": "ps aux showed only `hermes` (interactive CLI), `hermes_cli.main dashboard`, and `hermes_cli.main gateway run` as python processes touching the hermes-agent tree; lsof /home/ian-koratsky/.hermes/state.db confirmed only the dashboard and gateway PIDs had the file open.",
+      "file": "process listing (ps aux / lsof)",
+      "line": "n/a"
+    },
+    {
+      "claim": "Because SessionDB is shared (module-level hermes_state.SessionDB) across CLI/gateway/ACP and any of them can independently trigger WAL checkpoints/rotations on the same state.db, an ACP process -- if and when live -- would add another writer against the same file, but its write cadence (post-prompt/slash-command/model-switch, not per-tick) makes it a secondary/occasional contributor at most, not a primary driver of the observed DeletedWalGenerationError churn.",
+      "evidence": "_persist() writes are gated to discrete lifecycle events and even then often short-circuit ('Skip it in that case') when the owning agent already flushed incrementally, reducing actual write volume from this path.",
+      "file": "acp_adapter/session.py",
+      "line": "307"
+    }
+  ],
+  "confidence": 0.75,
+  "recommended_action": "Rule out acp_adapter as the active/primary cause for the incident window investigated since it was not running (confirmed via ps/lsof). Retain it on the suspect list only as a plausible secondary contributor for any future recurrence -- if an editor-integration (VS Code/Zed/JetBrains) process is later confirmed live during a WAL error, capture its PID's open-file table and correlate its _persist() calls' timestamps against the WAL rotation/error timestamps before concluding causation."
+}

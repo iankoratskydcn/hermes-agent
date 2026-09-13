@@ -1,0 +1,43 @@
+{
+  "reviewer_id": "L08",
+  "verdict": "not_the_cause",
+  "findings": [
+    {
+      "claim": "maybe_auto_prune_and_vacuum is called exactly twice in the codebase, both at process-startup construction time, never on a recurring in-process timer.",
+      "evidence": "gateway/run.py's HermesGateway._init_session_db() calls self._session_db._db.maybe_auto_prune_and_vacuum(...) directly (sync call, not scheduled). _init_session_db is itself called exactly once, from the constructor chain __init__ -> _init_runtime_caches -> _init_startup_checks -> _init_session_db -> _init_registries_and_clocks (gateway/run.py:3341-3344). cli.py's HermesCLI also calls _run_state_db_auto_maintenance(self._session_db) once, from its own startup init path (cli.py:2861). Neither call site is inside an asyncio loop, a threading.Timer, an asyncio.create_task periodic loop, or a cron job definition.",
+      "file": "gateway/run.py",
+      "line": "3343-3344, 3538-3556"
+    },
+    {
+      "claim": "cli.py has an equivalent single startup call, not a periodic one.",
+      "evidence": "_run_state_db_auto_maintenance() and _run_checkpoint_auto_maintenance() are defined as module-level helper functions (cli.py:1101-1120, 1123-1139) and invoked back-to-back exactly once at cli.py:2861-2862 during CLI init; no scheduling wrapper around the call site.",
+      "file": "cli.py",
+      "line": "2861-2862"
+    },
+    {
+      "claim": "The docstring for maybe_auto_prune_and_vacuum explicitly states the intended calling contract is once-per-process-startup, corroborating the code-level finding.",
+      "evidence": "\"Designed to be called once at startup from long-lived entrypoints (CLI, gateway, cron scheduler). See #54189.\" Additionally the function is internally throttled by min_interval_hours (default 24h) via a state_meta timestamp (last_auto_prune), which only protects against re-entrant calls WITHIN one process's lifetime -- it does not protect against multiple independent processes (e.g. CLI + gateway + cron scheduler + dashboard) each hitting their own once-at-startup call.",
+      "file": "hermes_state_maintenance.py",
+      "line": "357-379"
+    },
+    {
+      "claim": "maybe_auto_prune_checkpoints (tools/checkpoint_manager.py) uses the same startup-marker-file pattern, not a timer.",
+      "evidence": "Throttle is a plain file mtime check against CHECKPOINT_BASE/.last_prune (marker.read_text() age vs min_interval_hours*3600), read/written synchronously inside the function body -- no scheduling construct. Called from gateway/run.py:3559-3572 (inside _init_session_db, i.e. gateway startup) and cli.py:1123-1139 (called once from cli.py:2862, i.e. CLI startup).",
+      "file": "tools/checkpoint_manager.py",
+      "line": "1085-1109"
+    },
+    {
+      "claim": "No asyncio timer, threading.Timer, or periodic task registered anywhere in the codebase that calls any of these three maintenance functions on a 10-20 minute cadence.",
+      "evidence": "Full-repo search for maybe_auto_prune_and_vacuum / maybe_auto_archive / maybe_auto_prune_checkpoints across all files returns 13 matches total: gateway/run.py, hermes_state_sessions.py (definition re-export), cli.py, tools/checkpoint_manager.py, hermes_state_maintenance.py (definition), apps/desktop settings UI (unrelated display code), hermes_cli/web_routers/sessions.py and web_server_sessions.py (manual on-demand dashboard endpoints, user-triggered not timer-triggered), and test files. None of the non-test, non-definition call sites sit inside an asyncio.create_task loop, threading.Timer, or cron job registration.",
+      "file": "hermes_state_maintenance.py",
+      "line": "n/a (repo-wide grep)"
+    },
+    {
+      "claim": "Given every real call site is once-per-process-startup (not a recurring timer), a periodic 10-20 min VACUUM/checkpoint pass from these specific functions running inside a single long-lived gateway/dashboard process is NOT supported by the code as read. The observed 10-20 min DeletedWalGenerationError cadence is more likely explained by something else (repeated process restarts/respawns each re-triggering the once-at-startup maintenance, a supervisor restart loop, multiple independent long-lived processes -- gateway + dashboard + cron scheduler + CLI sessions -- each running their own once-at-startup pass and colliding, or a wal_checkpoint(TRUNCATE) call elsewhere e.g. inside vacuum() at hermes_state_maintenance.py:351 combined with _record_db_file_identity() rotating the generation while another process still holds the old generation's handle open).",
+      "file": "hermes_state_maintenance.py",
+      "line": "335-355"
+    }
+  ],
+  "confidence": 0.75,
+  "recommended_action": "Rule out these three functions as a periodic in-process timer cause -- confirmed startup-only, not timer-scheduled. Instead investigate: (1) whether multiple long-lived processes (gateway, dashboard/web_server, cron scheduler, one or more CLI/subagent sessions) are each independently running their once-at-startup maintenance pass, and whether their startup times are staggered ~10-20 min apart (e.g. via periodic restarts/watchdog respawns) which would explain the observed cadence without any timer inside this codebase; check process supervisor logs / uptime for gateway and dashboard around the incident timestamps. (2) The vacuum()/wal_checkpoint(TRUNCATE) + _record_db_file_identity() sequence at hermes_state_maintenance.py:335-355 as the actual generation-rotation mechanism -- confirm which process is calling vacuum() at each incident timestamp and whether a second process's AsyncSessionDB/state.db handle still references the pre-VACUUM generation when the DeletedWalGenerationError fires."
+}

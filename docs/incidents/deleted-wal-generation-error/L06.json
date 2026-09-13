@@ -1,0 +1,38 @@
+{
+  "reviewer_id": "L06",
+  "verdict": "not_involved",
+  "findings": [
+    {
+      "claim": "decision_hud_mcp.py does NOT import hermes_state, SessionDB, or any core state.db module; it only imports json, sqlite3, sys, time, uuid, pathlib.Path, and a local sibling module `db` (decision-hud/db.py) plus the vendored `mcp.server.mcpserver.MCPServer`.",
+      "evidence": "Full import block: `import json`, `import sqlite3`, `import sys`, `import time`, `import uuid`, `from pathlib import Path`; then `sys.path.insert(0, str(_PLUGIN_DIR)); import db` and `from mcp.server.mcpserver import MCPServer`. No reference to hermes_state, SessionDB, state.db, or ~/.hermes/state.db anywhere in the file.",
+      "file": "/home/ian-koratsky/.hermes/plugins/decision-hud/decision_hud_mcp.py",
+      "line": 21
+    },
+    {
+      "claim": "Every MCP tool handler (decision_push, decision_list, problem_report, decision_check, decision_defer, batch_approval_push, batch_approval_check, push_missing_constraint, check_constraint_resolved, mark_necessity, necessity_rate) opens its connection via the shared local helper `db.connect()`, not any state.db path or hermes_state.SessionDB API.",
+      "evidence": "Every tool body follows the pattern `conn = db.connect()` ... `finally: conn.close()` — 11 call sites, e.g. lines 81, 104, 131, 157, 181, 199, 215, 236, 254, 283, 310.",
+      "file": "/home/ian-koratsky/.hermes/plugins/decision-hud/decision_hud_mcp.py",
+      "line": 81
+    },
+    {
+      "claim": "db.connect()'s target file is a dedicated queue.db under ~/.hermes/decision_hud/, not ~/.hermes/state.db.",
+      "evidence": "db.py: `d = _hermes_home() / \"decision_hud\"; d.mkdir(parents=True, exist_ok=True); return d / \"queue.db\"` (db_path()), then `def connect() -> sqlite3.Connection: conn = sqlite3.connect(str(db_path()), timeout=30); conn.row_factory = sqlite3.Row`. This resolves to <hermes_home>/decision_hud/queue.db, a completely separate SQLite file from state.db.",
+      "file": "/home/ian-koratsky/.hermes/plugins/decision-hud/db.py",
+      "line": 206
+    },
+    {
+      "claim": "db.py's own module docstring documents this as a shared multi-writer SQLite file (its own file, WAL mode) by design, explicitly describing 'Two SQLite connections in WAL mode can safely share the file' for queue.db — this is a design statement about queue.db, not about state.db, and is irrelevant to the state.db WAL incident.",
+      "evidence": "\"Multiple processes/paths can insert `decisions` rows (NOT single-writer...)\" ... \"Two SQLite connections in WAL mode can safely share the file under this division of labor.\" — all referring to queue.db per the module header.",
+      "file": "/home/ian-koratsky/.hermes/plugins/decision-hud/db.py",
+      "line": 1
+    },
+    {
+      "claim": "No occurrence of the strings 'state.db', 'hermes_state', 'SessionDB', or 'read_only' anywhere in db.py (the only sibling module imported by decision_hud_mcp.py), confirming no path to the incident's file exists in this plugin's code.",
+      "evidence": "search_files content search for pattern 'state\\.db|hermes_state|SessionDB|read_only' across db.py returned total_count: 0.",
+      "file": "/home/ian-koratsky/.hermes/plugins/decision-hud/db.py",
+      "line": 0
+    }
+  ],
+  "confidence": 0.95,
+  "recommended_action": "Rule out decision_hud_mcp.py (and its sole dependency db.py) as a contributor to the DeletedWalGenerationError in ~/.hermes/state.db: this plugin never opens, imports, or references state.db in any form — it exclusively reads/writes its own separate SQLite file at <hermes_home>/decision_hud/queue.db via db.connect()/db.db_path(). Multiple concurrently-spawned copies of this plugin (one per hermes parent process) do open independent writer connections concurrently, but only to queue.db, which is designed for concurrent WAL-mode access per its own docstring. Investigate other MCP plugins/tools/core modules that do import hermes_state.SessionDB directly for the actual root cause."
+}
