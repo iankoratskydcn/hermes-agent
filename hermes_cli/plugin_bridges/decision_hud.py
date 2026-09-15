@@ -1,8 +1,8 @@
 """Bridge into the standalone decision-hud plugin's db.py — the Rule-1
-dispatch-side batch-approval gate (F1). Minimal cut: only
-check_batch_approval(). See decision-hub-first-work/plans/02-... for the
-follow-up functions (push_task_missing_constraint, check_constraint_resolved,
-push_problem_report) intentionally deferred to their own PRs.
+dispatch-side batch-approval gate (F1) plus Rule-4's retry-cap
+missing-constraint escalation. See decision-hub-first-work/plans/02-... for
+the follow-up functions (push_problem_report) intentionally deferred to
+their own PRs.
 """
 from __future__ import annotations
 
@@ -98,6 +98,82 @@ def check_batch_approval(*, project: str, batch_id: str) -> tuple[bool, str]:
         if not_approved_cls and isinstance(exc, not_approved_cls):
             return False, str(exc)
         return False, f"batch approval check errored: {exc}"
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def push_task_missing_constraint(
+    *, project: str, task_id: str, question: str, urgency: str = "normal",
+) -> tuple[bool, str]:
+    """Push a Rule-4 ``missing_constraint`` decision-hud card for one task.
+
+    ``(True, "")`` on a successful push. ``(False, reason)`` for every
+    failure mode, INCLUDING decision-hud's own duplicate-open-constraint
+    ``ValueError`` (a task that already has an unresolved missing_constraint
+    row for this ``(project, task_id)`` must not get a second card — the
+    caller (the retry-cap dispatch gate) treats that as "already escalated,
+    nothing new to do" rather than an error to surface). Never raises —
+    matches :func:`check_batch_approval`'s never-raises contract so the
+    dispatch-side caller's fail-closed default applies uniformly.
+    """
+    try:
+        db = _load_decision_hud_db()
+    except Exception as exc:
+        return False, f"decision-hud unavailable: {exc}"
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = db.connect()
+        db.push_missing_constraint(
+            conn, project_id=project, task_id=task_id, question=question, urgency=urgency,
+        )
+        return True, ""
+    except ValueError as exc:
+        # Duplicate open constraint for this (project, task_id) — not an
+        # error, just "already escalated, don't push a second card".
+        return False, str(exc)
+    except Exception as exc:
+        return False, f"push_missing_constraint errored: {exc}"
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def check_constraint_resolved(*, project: str, task_id: str) -> bool:
+    """``True`` iff decision-hud has a RESOLVED ``missing_constraint``
+    decision for this exact ``(project, task_id)`` (the most recent row —
+    see decision-hud's ``require_constraint_resolved`` docstring: an old
+    resolved escalation never masks a fresh unresolved one). ``False`` for
+    pending/missing/any error — every failure mode (plugin not installed, DB
+    locked/corrupt, schema mismatch) folds into ``False`` so the dispatch-
+    side caller's fail-closed default applies uniformly, mirroring
+    :func:`check_batch_approval`'s never-raises contract.
+    """
+    try:
+        db = _load_decision_hud_db()
+    except Exception:
+        return False
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = db.connect()
+        db.require_constraint_resolved(conn, project_id=project, task_id=task_id)
+        return True
+    except Exception as exc:
+        # ConstraintNotResolved is resolved as an attribute on the loaded
+        # module, not imported statically — mirrors check_batch_approval's
+        # getattr-with-sentinel pattern so a partial/broken decision-hud
+        # install can't leak an AttributeError through this "never raises"
+        # boundary.
+        not_resolved_cls = getattr(db, "ConstraintNotResolved", ())
+        if not_resolved_cls and isinstance(exc, not_resolved_cls):
+            return False
+        return False
     finally:
         if conn is not None:
             try:
