@@ -813,6 +813,11 @@ _LATER_TASK_COLUMNS = (
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
+    # Wave2/2c gate precheck (hermes_cli/kanban_gate_precheck.py): additive,
+    # nullable columns. NULL = not populated; gate_precheck() reads them
+    # lazily and never forces population.
+    ("ears_sentence", "ears_sentence TEXT"),
+    ("scope_paths", "scope_paths TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
