@@ -175,6 +175,36 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_boards_set_dispatch(args: argparse.Namespace) -> int:
+    normed, rc = _board_slug_arg(args, "set-dispatch", must_exist=True)
+    if rc:
+        return rc
+    enabled = args.state == "on"
+    meta = kb.write_board_metadata(normed, dispatch_enabled=enabled)
+    print(f"Board {normed!r} dispatch {'enabled' if meta['dispatch_enabled'] else 'disabled'}.")
+    return 0
+
+
+def _cmd_boards_set_auto_decompose(args: argparse.Namespace) -> int:
+    normed, rc = _board_slug_arg(args, "set-auto-decompose", must_exist=True)
+    if rc:
+        return rc
+    enabled = args.state == "on"
+    meta = kb.write_board_metadata(normed, auto_decompose_enabled=enabled)
+    print(f"Board {normed!r} auto-decompose {'enabled' if meta['auto_decompose_enabled'] else 'disabled'}.")
+    return 0
+
+
+def _cmd_boards_set_review_dispatch(args: argparse.Namespace) -> int:
+    normed, rc = _board_slug_arg(args, "set-review-dispatch", must_exist=True)
+    if rc:
+        return rc
+    enabled = args.state == "on"
+    meta = kb.write_board_metadata(normed, review_dispatch_enabled=enabled)
+    print(f"Board {normed!r} review-dispatch {'enabled' if meta['review_dispatch_enabled'] else 'disabled'}.")
+    return 0
+
+
 def _cmd_boards_export(args: argparse.Namespace) -> int:
     from hermes_cli import kanban_transfer
     from hermes_cli.sizefmt import format_bytes
@@ -229,6 +259,9 @@ _BOARD_HANDLERS = {
     "show": _cmd_boards_show, "current": _cmd_boards_show,
     "rename": _cmd_boards_rename,
     "set-default-workdir": _cmd_boards_set_default_workdir,
+    "set-dispatch": _cmd_boards_set_dispatch,
+    "set-auto-decompose": _cmd_boards_set_auto_decompose,
+    "set-review-dispatch": _cmd_boards_set_review_dispatch,
     "export": _cmd_boards_export,
     "import": _cmd_boards_import,
 }

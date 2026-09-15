@@ -113,6 +113,18 @@ _BOARD_SPECS = [
         _SLUG,
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
+    _cmd("set-dispatch", [
+        _SLUG,
+        _arg("state", choices=("on", "off"), help="Enable or disable dispatch for this board"),
+    ], help="Enable or disable worker dispatch for a board"),
+    _cmd("set-auto-decompose", [
+        _SLUG,
+        _arg("state", choices=("on", "off"), help="Enable or disable auto-decompose for this board"),
+    ], help="Enable or disable auto-decompose for a board"),
+    _cmd("set-review-dispatch", [
+        _SLUG,
+        _arg("state", choices=("on", "off"), help="Enable or disable review dispatch for this board"),
+    ], help="Enable or disable review dispatch for a board"),
     _cmd("export", [
         _arg("slug", nargs="?", help="Board to export (default: the current board)"),
         _arg("-o", "--output", help="Archive path (default: ./<slug>.tar.gz)"),
