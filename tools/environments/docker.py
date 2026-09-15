@@ -29,6 +29,7 @@ from tools.environments.docker_egress import (
     check_forward_env_collisions, merge_egress_env,
 )
 from tools.environments.path_utils import sanitize_task_id_for_path
+from tools.environments.docker_scope_binds import scope_bind_args
 from tools.environments.remote_common import (
     bash_argv, client_env_with, load_hermes_env_vars, prepend_unset, resolve_passthrough_env, run_capture)
 
@@ -280,6 +281,63 @@ def _extra_args_set_shm_size(extra_args: list) -> bool:
 
 _NETWORK_FLAGS = ("--network", "--net")
 
+_NAMESPACE_FLAGS = ("--pid", "--ipc", "--uts", "--userns")
+
+
+def _extra_args_namespace_violation(extra_args: list) -> Optional[str]:
+    """Return a docker_extra_args flag that would escape a container namespace.
+
+    Docker accepts both ``--option value`` and ``--option=value``.  Security
+    validation must inspect the canonical option and value rather than only
+    matching one spelling of the raw token.
+    """
+    args = [a for a in (extra_args or []) if isinstance(a, str)]
+    for i, arg in enumerate(args):
+        option, equals_value = (arg.split("=", 1) + [None])[:2] if "=" in arg else (arg, None)
+        next_value = args[i + 1] if i + 1 < len(args) else None
+        value = equals_value if equals_value is not None else next_value
+        if option == "--privileged":
+            return arg if equals_value is not None else option
+        if option == "--cap-add" and value is not None and value.strip().upper() == "ALL":
+            return arg if equals_value is not None else f"{option} {value}"
+        if option == "--security-opt" and value is not None and value.strip().lower() == "apparmor=unconfined":
+            return arg if equals_value is not None else f"{option} {value}"
+        for flag in _NAMESPACE_FLAGS:
+            if option == flag and value is not None and value.strip().lower() == "host":
+                return arg if equals_value is not None else f"{option} {value}"
+    return None
+
+
+_DIGEST_IMAGE_RE = re.compile(r"^.+@sha256:[0-9a-fA-F]{64}$")
+
+
+def _validate_image_pin(image: str, *, require_digest: bool, docker_exe: str | None = None) -> str | None:
+    """Validate and, when required, verify an image's immutable resolved digest."""
+    if not require_digest:
+        return None
+    if not isinstance(image, str) or not _DIGEST_IMAGE_RE.fullmatch(image):
+        raise RuntimeError(
+            f"Docker image {image!r} is not digest-pinned; use repo@sha256:<64 hex> "
+            "(obtain one with docker inspect --format '{{index .RepoDigests 0}}' <tag>).")
+    pinned_repository, pinned_digest = image.rsplit("@", 1)
+    pinned_identity = f"{pinned_repository}@{pinned_digest}".lower()
+    exe = docker_exe or find_docker() or "docker"
+    result = _docker_query(
+        [exe, "image", "inspect", image, "--format", "{{index .RepoDigests 0}}"], timeout=15,
+        fail="Docker: could not verify digest for %s: %s", fail_args=(image,))
+    resolved_lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()] if result is not None else []
+    if len(resolved_lines) != 1 or "@" not in resolved_lines[0]:
+        resolved_identity = "<ambiguous>" if len(resolved_lines) > 1 else "<unavailable>"
+        raise RuntimeError(
+            f"Docker image digest mismatch for {image!r}: resolved {resolved_identity!r}, "
+            f"pinned {pinned_identity!r}; refusing to launch.")
+    resolved_identity = resolved_lines[0].lower()
+    if resolved_identity != pinned_identity:
+        raise RuntimeError(
+            f"Docker image digest mismatch for {image!r}: resolved {resolved_identity!r}, "
+            f"pinned {pinned_identity!r}; refusing to launch.")
+    return pinned_digest.lower()
+
 
 def _extra_args_network_mode(extra_args: list) -> Optional[str]:
     """Network mode requested by ``docker_extra_args`` (``--network none`` / ``--network=none`` /
@@ -528,7 +586,9 @@ class DockerEnvironment(BaseEnvironment):
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
         shared_container_key: str = "",
-        snap_compat: bool = False):
+        snap_compat: bool = False,
+        scope: dict | None = None,
+        require_digest_pin: bool = False):
         if cwd == "~":
             cwd = "/root"
         super().__init__(cwd=cwd, timeout=timeout)
@@ -538,6 +598,8 @@ class DockerEnvironment(BaseEnvironment):
         # (docker + container_persistent: false): removed at session close/idle timeout.
         self._session_scoped = False
         self._task_id = task_id
+        self._scope = scope
+        self._require_digest_pin = bool(require_digest_pin)
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
         self._init_unset_passthrough_names: tuple[str, ...] = ()
@@ -550,18 +612,25 @@ class DockerEnvironment(BaseEnvironment):
             logger.warning("docker_volumes config is not a list: %r", volumes)
             volumes = []
 
+        namespace_violation = _extra_args_namespace_violation(extra_args)
+        if namespace_violation:
+            raise RuntimeError(
+                "terminal.docker_extra_args requests the forbidden namespace escape "
+                f"{namespace_violation!r}; remove it (Docker namespaces are a security boundary).")
+
         _ensure_docker_available()
+        self._docker_exe = find_docker() or "docker"
+        image_digest = _validate_image_pin(image, require_digest=self._require_digest_pin, docker_exe=self._docker_exe)
 
         resource_args = self._resource_args(image, cpu, memory, disk, network, shm_size, extra_args)
-        volume_args, writable_args = self._mount_args(volumes, host_cwd, auto_mount_cwd, task_id)
+        volume_args, writable_args, scoped_rootfs = self._mount_args(
+            volumes, host_cwd, auto_mount_cwd, task_id, scope)
         volume_args.extend(_readonly_skill_mount_args())
         egress_label, egress_volume_args, egress_host_args, env_args, validated_extra = (
             self._egress_and_env_args(extra_args))
         volume_args.extend(egress_volume_args)
         user_args = _host_user_args(run_as_host_user)
 
-        # Resolved once so it works when /usr/local/bin is not in PATH (macOS services).
-        self._docker_exe = find_docker() or "docker"
 
         # s6-overlay images (e.g. hermes-agent:latest) already use /init as PID 1 and exec
         # /run/s6/basedir/bin/init during startup. For those images we must (a) skip Docker's --init (two
@@ -576,6 +645,8 @@ class DockerEnvironment(BaseEnvironment):
                 image)
         security_args = _build_security_args(
             run_as_host_user and bool(user_args), run_exec=image_uses_s6_init, snap_compat=snap_compat)
+        if scoped_rootfs:
+            security_args.append("--read-only")
         self._snap_compat = snap_compat
         if snap_compat:
             logger.warning(
@@ -600,6 +671,8 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
             _EGRESS_LABEL_KEY: egress_label}
+        if image_digest:
+            self._labels["hermes-image-digest"] = image_digest
         # Saved for container recreation on "No such container" recovery.
         self._image = image
         self._image_uses_s6_init = image_uses_s6_init
@@ -679,10 +752,16 @@ class DockerEnvironment(BaseEnvironment):
             # extra_network == "none": same intent stated twice; the extra arg carries it once.
         return args
 
-    def _mount_args(self, volumes, host_cwd, auto_mount_cwd, task_id) -> tuple[list[str], list[str]]:
+    def _mount_args(self, volumes, host_cwd, auto_mount_cwd, task_id, scope=None) -> tuple[list[str], list[str], bool]:
         """``(volume_args, writable_args)`` for user volumes, host cwd and /workspace,/root.
         Persistent mode bind-mounts from TERMINAL_SANDBOX_DIR (default ~/.hermes/sandboxes/)."""
         volume_args: list[str] = []
+        if scope is not None:
+            if volumes:
+                raise ValueError("docker_scope is active; unscoped docker_volumes are forbidden")
+            project_root = host_cwd or os.getcwd()
+            scoped_args, rootfs_read_only = scope_bind_args(scope, project_root)
+            return scoped_args, ["--tmpfs", "/home:rw,exec,size=1g"], rootfs_read_only
         for vol in (volumes or []):
             if not isinstance(vol, str):
                 logger.warning("Docker volume entry is not a string: %r", vol)
@@ -730,7 +809,7 @@ class DockerEnvironment(BaseEnvironment):
             volume_args = ["-v", f"{host_cwd_abs}:/workspace", *volume_args]
         elif workspace_explicitly_mounted:
             logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
-        return volume_args, writable_args
+        return volume_args, writable_args, False
 
     def _attach_existing_container(self, task_label, profile_name, egress_label, network: bool) -> bool:
         """Attach to a prior process's labeled container ("ONE long-lived container shared
