@@ -715,6 +715,10 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    # Rule 2: heuristic verification-rigor mode ('autocomplete'|'chat'|'agent')
+    # set by the decomposer at creation time; NULL if unset. Schema-population
+    # only — see kanban_task_mode.py.
+    task_mode: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -744,7 +748,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "task_mode",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -941,7 +945,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Rule 2: verification-rigor classification ('autocomplete'|'chat'|
+    -- 'agent') assigned by the decomposer's heuristic classifier at
+    -- creation time (hermes_cli/kanban_task_mode.py). NULL for tasks
+    -- created outside the decomposer (CLI, dashboard) or on legacy rows.
+    -- Schema-population only today: no dispatch/gate/enforcement logic
+    -- reads this column.
+    task_mode            TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -3484,10 +3495,14 @@ def invalidate_descendants_for_parent_reopen(
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+    task_mode: Optional[str] = None,
 ) -> bool:
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
     gating still applies; the audit comment is written only when a field changed.
+
+    ``task_mode``: Rule 2 schema-population field (see kanban_task_mode.py).
+    Unset (``None``) leaves the column untouched.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
@@ -3514,6 +3529,9 @@ def specify_triage_task(
             sets.append("assignee = ?")
             params.append(assignee)
             changed_fields.append("assignee")
+        if task_mode is not None:
+            sets.append("task_mode = ?")
+            params.append(task_mode)
         params.append(task_id)
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "

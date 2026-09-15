@@ -813,6 +813,9 @@ _LATER_TASK_COLUMNS = (
     # Typed block reason (VALID_BLOCK_KINDS); NULL = generic human blocker.
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
+    # Rule 2: heuristic verification-rigor mode set by the decomposer at
+    # creation time; additive nullable column, see SCHEMA_SQL for semantics.
+    ("task_mode", "task_mode TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

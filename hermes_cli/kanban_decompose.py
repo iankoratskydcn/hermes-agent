@@ -30,6 +30,7 @@ from hermes_cli.kanban_specify import (
     _call_aux, _extract_json_blob, _load_triage_task, _task_prompt_fields, _title_body,
 )
 from hermes_cli.kanban_specify import _profile_author as _specify_author
+from hermes_cli.kanban_task_mode import classify_task_mode
 
 logger = logging.getLogger(__name__)
 
@@ -220,9 +221,15 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
         )
     if title_val is None and body_val is None:
         return DecomposeOutcome(task.id, False, "decomposer returned fanout=false with no title/body")
+    # Rule 2: classify verification-rigor mode from the (possibly tightened)
+    # title/body before promotion — heuristic, non-blocking (kanban_task_mode.py).
+    mode_title = title_val if title_val is not None else task.title
+    mode_body = body_val if body_val is not None else task.body
+    task_mode_val = classify_task_mode(mode_title, mode_body)
     with kbc.connect_closing() as conn:
         ok = kb.specify_triage_task(
             conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,
+            task_mode=task_mode_val,
         )
     if not ok:
         return DecomposeOutcome(task.id, False, "task moved out of triage before promotion")
@@ -253,10 +260,15 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
             parents = []
+        title_clean = title.strip()[:200]
+        body_clean = body.strip() if isinstance(body, str) else ""
         children.append({
-            "title": title.strip()[:200],
-            "body": body.strip() if isinstance(body, str) else "",
+            "title": title_clean,
+            "body": body_clean,
             "assignee": chosen,
+            # Rule 2: classify each child's verification-rigor mode at
+            # creation time (heuristic, non-blocking — kanban_task_mode.py).
+            "task_mode": classify_task_mode(title_clean, body_clean),
             # Drop non-int, out-of-range and self parent indices.
             "parents": [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx],
         })
