@@ -96,7 +96,7 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
-VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir", "projected"}
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
