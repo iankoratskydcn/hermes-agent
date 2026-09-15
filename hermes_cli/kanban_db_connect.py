@@ -823,6 +823,9 @@ _LATER_TASK_COLUMNS = (
     # Rule 2: heuristic verification-rigor mode set by the decomposer at
     # creation time; additive nullable column, see SCHEMA_SQL for semantics.
     ("task_mode", "task_mode TEXT"),
+    ("role", "role TEXT"),
+    ("card_class", "card_class TEXT"),
+    ("scope_manifest", "scope_manifest TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

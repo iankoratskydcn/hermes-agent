@@ -91,7 +91,7 @@ VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", 
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "scope"}
 
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
@@ -828,6 +828,10 @@ class Task:
     # set by the decomposer at creation time; NULL if unset. Schema-population
     # only — see kanban_task_mode.py.
     task_mode: Optional[str] = None
+    # Isolation policy is task-level metadata, never inferred from an assignee profile.
+    role: Optional[str] = None
+    card_class: Optional[str] = None
+    scope_manifest: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -836,6 +840,8 @@ class Task:
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
         scope_parsed = _json_or(g("scope_paths"))
         scope_paths_value = list(scope_parsed) if isinstance(scope_parsed, list) else None
+        manifest_parsed = _json_or(g("scope_manifest"))
+        scope_manifest_value = manifest_parsed if isinstance(manifest_parsed, dict) else None
         return cls(
             **{col: row[col] for col in _TASK_REQUIRED_COLUMNS},
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
@@ -846,6 +852,7 @@ class Task:
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
             scope_paths=scope_paths_value,
+            scope_manifest=scope_manifest_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
@@ -861,7 +868,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
-    "ears_sentence", "task_mode",
+    "ears_sentence", "task_mode", "role", "card_class",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1094,7 +1101,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- created outside the decomposer (CLI, dashboard) or on legacy rows.
     -- Schema-population only today: no dispatch/gate/enforcement logic
     -- reads this column.
-    task_mode            TEXT
+    task_mode            TEXT,
+    -- Isolation policy is explicit task metadata. A missing manifest is a hard failure
+    -- for isolation-implying roles/card classes; never treat it as an opt-in check.
+    role                 TEXT,
+    card_class           TEXT,
+    scope_manifest       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1396,6 +1408,8 @@ def create_task(
     completion_contract: Optional[str] = None,
     ears_sentence: Optional[str] = None,
     scope_paths: Optional[Iterable[str]] = None,
+    role: Optional[str] = None, card_class: Optional[str] = None,
+    scope_manifest: Optional[dict] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1497,8 +1511,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract,
-                        ears_sentence, scope_paths
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ears_sentence, scope_paths, role, card_class, scope_manifest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1510,6 +1524,9 @@ def create_task(
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                         ears_sentence,
                         json.dumps(scope_paths_list) if scope_paths_list is not None else None,
+                        role.strip() if isinstance(role, str) and role.strip() else None,
+                        card_class.strip() if isinstance(card_class, str) and card_class.strip() else None,
+                        json.dumps(scope_manifest, ensure_ascii=False) if scope_manifest is not None else None,
                     ),
                 )
                 for pid in parents:
@@ -2787,6 +2804,12 @@ def complete_task(
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
     """
     now = int(time.time())
+    # Isolation ingest is a mandatory pre-completion gate. It quarantines on
+    # malformed/missing scope or unauthorized diff; callers cannot opt out.
+    from hermes_cli.kanban_ingest import run_ingest_pipeline
+    ingest = run_ingest_pipeline(conn, get_task(conn, task_id), expected_run_id=expected_run_id)
+    if not ingest.ok:
+        return False
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
