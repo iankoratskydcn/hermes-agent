@@ -715,6 +715,7 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    ears_sentence: Optional[str] = None      # Rule 6 EARS-restated requirement; NULL = unset/refused
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -744,7 +745,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "ears_sentence",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -941,7 +942,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Rule 6 EARS-restated requirement (mechanically validated against the
+    -- five EARS templates before storage; NULL when unset or refused — see
+    -- kanban_decompose.py's validate_ears_sentence()/_resolve_ears_sentence().
+    ears_sentence         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -3484,10 +3489,14 @@ def invalidate_descendants_for_parent_reopen(
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+    ears_sentence: Optional[str] = None,
 ) -> bool:
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
     gating still applies; the audit comment is written only when a field changed.
+    ``ears_sentence``: Rule 6 EARS-restated requirement, stored verbatim when
+    given (already mechanically validated by the caller — see
+    ``kanban_decompose._resolve_ears_sentence``; never validated here).
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
@@ -3514,6 +3523,9 @@ def specify_triage_task(
             sets.append("assignee = ?")
             params.append(assignee)
             changed_fields.append("assignee")
+        if ears_sentence is not None:
+            sets.append("ears_sentence = ?")
+            params.append(ears_sentence)
         params.append(task_id)
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
