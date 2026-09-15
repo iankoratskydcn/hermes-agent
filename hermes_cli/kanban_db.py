@@ -884,6 +884,8 @@ class Task:
     role: Optional[str] = None
     card_class: Optional[str] = None
     scope_manifest: Optional[dict] = None
+    obligations: Optional[list] = None
+    feedback_schema: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -920,7 +922,11 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+<<<<<<< HEAD
     "ears_sentence", "task_mode", "role", "card_class",
+=======
+    "ears_sentence", "task_mode", "obligations", "feedback_schema", "role", "card_class",
+>>>>>>> 059d888216 (feat(kanban): add sandboxed contract test tool and obligation matrix)
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1162,7 +1168,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for isolation-implying roles/card classes; never treat it as an opt-in check.
     role                 TEXT,
     card_class           TEXT,
-    scope_manifest       TEXT
+    scope_manifest       TEXT,
+    obligations          TEXT,
+    feedback_schema      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (

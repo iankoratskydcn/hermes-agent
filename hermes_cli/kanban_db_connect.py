@@ -848,6 +848,8 @@ _LATER_TASK_COLUMNS = (
     ("role", "role TEXT"),
     ("card_class", "card_class TEXT"),
     ("scope_manifest", "scope_manifest TEXT"),
+    ("obligations", "obligations TEXT"),
+    ("feedback_schema", "feedback_schema TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

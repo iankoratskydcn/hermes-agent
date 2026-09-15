@@ -520,6 +520,14 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
     ["task_id"],
 )
 
+KANBAN_RUN_CONTRACT_TESTS_SCHEMA = _schema(
+    "run_contract_tests",
+    "Run the task's frozen contract obligations in the dispatcher-owned sandbox and return only PASS/FAIL obligation results. Available only to single-blind development workers.",
+    {},
+    [],
+)
+
+
 KANBAN_LINK_SCHEMA = _schema(
     "kanban_link",
     (

@@ -24,7 +24,7 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA, KANBAN_RUN_CONTRACT_TESTS_SCHEMA)
 
 logger = logging.getLogger(__name__)
 
@@ -1098,6 +1098,51 @@ def _handle_link(args: dict, **kw) -> str:
                    **({"gated_by": parent_id} if gated else {}))
 
 
+# --- Contract-test harness ---
+
+def _check_run_contract_tests() -> bool:
+    """Expose the tool only to a scoped single-blind development worker."""
+    if not _visible(to_env_worker=True):
+        return False
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not tid:
+        return False
+    try:
+        with _board(None, quiet_close=True) as (kb, conn):
+            task = kb.get_task(conn, tid)
+            return bool(task and getattr(task, "card_class", None) == "single_blind"
+                        and getattr(task, "role", "dev") == "dev")
+    except Exception:
+        return False
+
+
+@no_cache_check_fn
+def _check_contract_tests() -> bool:
+    return _check_run_contract_tests()
+
+
+@_kanban_handler("run_contract_tests")
+def _handle_run_contract_tests(args: dict, **kw) -> str:
+    """Run frozen obligations and return only the reduced matrix."""
+    del args, kw
+    tid = _worker_guard("run_contract_tests", {})
+    with _board(None) as (kb, conn):
+        task = _existing_task(kb, conn, tid)
+        _check(getattr(task, "card_class", None) == "single_blind",
+               "run_contract_tests requires a single_blind card")
+        obligations = getattr(task, "obligations", None)
+        if isinstance(obligations, str):
+            try:
+                obligations = json.loads(obligations)
+            except (TypeError, ValueError):
+                obligations = None
+        _check(isinstance(obligations, list) and obligations,
+               "run_contract_tests requires frozen obligations on the task")
+        snapshot = os.environ.get("HERMES_KANBAN_WORKSPACE") or os.getcwd()
+        from hermes_cli.kanban_harness import run_harness
+        return json.dumps(run_harness(tid, snapshot, obligations))
+
+
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
@@ -1116,9 +1161,10 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
-    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+    ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"),
+    ("run_contract_tests", KANBAN_RUN_CONTRACT_TESTS_SCHEMA, _handle_run_contract_tests, "🧪"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
-    _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode
+    _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else (_check_contract_tests if _name == "run_contract_tests" else _check_kanban_mode)
     registry.register(name=_name, toolset="kanban", schema=_sch, handler=_handler, emoji=_emoji,
                       check_fn=_gate)
