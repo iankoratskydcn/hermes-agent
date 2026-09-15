@@ -890,6 +890,14 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    # Frozen execution tuple: immutable per-attempt inputs captured before spawn.
+    exec_tuple_hash: Optional[str] = None
+    base_sha: Optional[str] = None
+    spec_rev: Optional[str] = None
+    ceiling_rev: Optional[str] = None
+    manifest_hash: Optional[str] = None
+    toolchain_hash: Optional[str] = None
+    sandbox_policy_hash: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -904,6 +912,13 @@ class Run:
             started_at=int(row["started_at"]),
             ended_at=_opt_int(row["ended_at"]),
             metadata=_json_or(row["metadata"]),
+            exec_tuple_hash=_row_get(row, "exec_tuple_hash"),
+            base_sha=_row_get(row, "base_sha"),
+            spec_rev=_row_get(row, "spec_rev"),
+            ceiling_rev=_row_get(row, "ceiling_rev"),
+            manifest_hash=_row_get(row, "manifest_hash"),
+            toolchain_hash=_row_get(row, "toolchain_hash"),
+            sandbox_policy_hash=_row_get(row, "sandbox_policy_hash"),
         )
 
 
@@ -1131,7 +1146,16 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Frozen execution tuple, captured before each worker session starts.
+    -- These are nullable for legacy/terminal runs that predate isolation.
+    exec_tuple_hash     TEXT,
+    base_sha            TEXT,
+    spec_rev            TEXT,
+    ceiling_rev         TEXT,
+    manifest_hash       TEXT,
+    toolchain_hash      TEXT,
+    sandbox_policy_hash TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2300,17 +2324,22 @@ def _claim_and_open_run(
         "SELECT assignee, max_runtime_seconds, current_step_key "
         "FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
+    task = get_task(conn, task_id)
+    from hermes_cli.kanban_db_workspace import exec_tuple_values, resolve_exec_tuple
+    frozen = resolve_exec_tuple(task, conn) if task is not None else None
     run_cur = conn.execute(
         """
         INSERT INTO task_runs (
             task_id, profile, step_key, status,
             claim_lock, claim_expires, max_runtime_seconds,
-            started_at
-        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+            started_at, exec_tuple_hash, base_sha, spec_rev, ceiling_rev,
+            manifest_hash, toolchain_hash, sandbox_policy_hash
+        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
             lock, expires, trow["max_runtime_seconds"] if trow else None, now,
+            *(exec_tuple_values(frozen) if frozen is not None else (None,) * 7),
         ),
     )
     run_id = run_cur.lastrowid
