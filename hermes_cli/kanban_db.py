@@ -561,10 +561,16 @@ def write_board_metadata(
     board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
     icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
     default_workdir: Optional[str] = None, project_id: Optional[str] = None,
+    dispatch_enabled: Optional[bool] = None, auto_decompose_enabled: Optional[bool] = None,
+    review_dispatch_enabled: Optional[bool] = None,
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
     set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
-    "" = clear (``project_id`` is not validated here)."""
+    "" = clear (``project_id`` is not validated here). ``dispatch_enabled`` /
+    ``auto_decompose_enabled`` / ``review_dispatch_enabled``: per-board dispatcher
+    toggles, ``None`` = unchanged (same tri-state convention as the fields above).
+    Display-only at this layer — wiring these into actual dispatch/decompose/review
+    gating is deferred to a follow-up change."""
     _assert_not_delegated_child_mutation()
     slug = _slug_or_default(board)
     meta = read_board_metadata(slug)
@@ -580,6 +586,13 @@ def write_board_metadata(
     for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
         if value is not None:
             meta[key] = str(value) if value else None
+    for key, value in (
+        ("dispatch_enabled", dispatch_enabled),
+        ("auto_decompose_enabled", auto_decompose_enabled),
+        ("review_dispatch_enabled", review_dispatch_enabled),
+    ):
+        if value is not None:
+            meta[key] = bool(value)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)

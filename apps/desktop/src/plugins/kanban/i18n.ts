@@ -164,6 +164,10 @@ type KanbanMessages = {
   board: string
   newBoard: string
   newBoardDots: string
+  // board-header dispatcher toggles
+  headerDispatch: string
+  headerDecompose: string
+  headerReview: string
   // Menu labels are bare verbs — the board they act on is the one named in the
   // switcher's trigger. The nouns come back for the native file-dialog and
   // in-app dialog titles, which stand alone.
@@ -379,6 +383,9 @@ export const en: KanbanMessages = {
   board: 'Board',
   newBoard: 'New board',
   newBoardDots: 'New board…',
+  headerDispatch: 'Dispatch',
+  headerDecompose: 'Decompose',
+  headerReview: 'Review',
   exportDots: 'Export…',
   importDots: 'Import…',
   renameDots: 'Rename…',
@@ -590,6 +597,9 @@ const ja: KanbanMessages = {
   board: 'ボード',
   newBoard: '新しいボード',
   newBoardDots: '新しいボード…',
+  headerDispatch: 'ディスパッチ',
+  headerDecompose: '分解',
+  headerReview: 'レビュー',
   exportDots: 'エクスポート…',
   importDots: 'インポート…',
   renameDots: '名前を変更…',
@@ -799,6 +809,9 @@ const zh: KanbanMessages = {
   board: '面板',
   newBoard: '新建面板',
   newBoardDots: '新建面板…',
+  headerDispatch: '调度',
+  headerDecompose: '分解',
+  headerReview: '审查',
   exportDots: '导出…',
   importDots: '导入…',
   renameDots: '重命名…',
@@ -1007,6 +1020,9 @@ const zhHant: KanbanMessages = {
   board: '面板',
   newBoard: '新增面板',
   newBoardDots: '新增面板…',
+  headerDispatch: '調度',
+  headerDecompose: '分解',
+  headerReview: '審查',
   exportDots: '匯出…',
   importDots: '匯入…',
   renameDots: '重新命名…',
