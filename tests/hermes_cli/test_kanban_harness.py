@@ -21,3 +21,29 @@ def test_run_harness_uses_injected_executor_and_returns_matrix(tmp_path):
         assert snapshot == str(tmp_path)
         open(report_path, "w", encoding="utf-8").write('{"tests": [{"req": ["REQ-A"], "outcome": "passed"}]}')
     assert run_harness("task", str(tmp_path), ["REQ-A"], executor=executor) == {"results": {"REQ-A": "PASS"}}
+
+
+def test_run_harness_canary_in_failed_assertion_never_reaches_tool_result(tmp_path):
+    canary = "CONTRACT_ASSERTION_CANARY_DO_NOT_LEAK_7f4d"
+
+    def executor(snapshot, report_path, **kwargs):
+        assert snapshot == str(tmp_path)
+        # This models the JSON report produced by the sandboxed test runner.  The
+        # assertion is deliberately failed and the canary appears in several
+        # report-only fields, including a nested exception chain.
+        report = {
+            "tests": [{
+                "req": ["REQ-A"], "outcome": "failed",
+                "longrepr": f"AssertionError: {canary}",
+                "call": {"traceback": [{"message": canary}]},
+            }],
+            "stdout": canary,
+            "logs": [{"message": canary}],
+        }
+        import json
+        with open(report_path, "w", encoding="utf-8") as stream:
+            json.dump(report, stream)
+
+    result = run_harness("task", str(tmp_path), ["REQ-A"], executor=executor)
+    assert result["results"]["REQ-A"] == "FAIL"
+    assert canary not in str(result)

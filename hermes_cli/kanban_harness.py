@@ -44,12 +44,28 @@ def obligation_matrix(obligations: list[str], report: Mapping[str, Any]) -> dict
 
 
 def sanitize(report: Mapping[str, Any], obligations: list[str], schema: str = "matrix") -> dict[str, Any]:
-    """Return the sole dev-facing shape; never copy report text, traces, or logs."""
+    """Return the sole dev-facing shape; never copy report text, traces, or logs.
+
+    This is an allowlist boundary, rather than a redaction pass.  In particular,
+    no value from a test record is ever used in the returned object.  That makes
+    assertion messages, tracebacks, exception chains, and plugin-added report
+    fields unreachable even when they contain secrets or test canaries.
+    """
+    if not isinstance(report, Mapping):
+        raise HarnessError("contract-test report has invalid shape")
+    if not isinstance(obligations, list) or not obligations:
+        raise HarnessError("contract-test obligations are unavailable")
     if schema == "full":
         raise HarnessError("full feedback is not available for contract tests")
     if schema not in {"matrix", "obligations", ""}:
         raise HarnessError("unsupported feedback schema")
-    return {"results": obligation_matrix(obligations, report)}
+    # Build a fresh object from the finite status vocabulary.  Do not return the
+    # input mapping (or any nested portion of it), since callers may serialize it
+    # directly to stdout, structured tool fields, and gateway logs.
+    results = obligation_matrix(obligations, report)
+    if any(status not in {"PASS", "FAIL"} for status in results.values()):
+        raise HarnessError("contract-test result contains an invalid status")
+    return {"results": {str(req): str(status) for req, status in results.items()}}
 
 
 def _default_executor(snapshot_path: str, report_path: str, *, image: str, timeout: int) -> None:
