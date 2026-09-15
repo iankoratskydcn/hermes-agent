@@ -1572,6 +1572,11 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+            _fire_kanban_lifecycle_hook(
+                "on_kanban_task_created", task_id,
+                board=board or get_current_board(), assignee=assignee, run_id=None,
+                project_id=project_id, workspace_kind=workspace_kind,
+            )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -2879,7 +2884,10 @@ def complete_task(
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
-        _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
+        _fire_task_hook(
+            "kanban_task_completed", _done_task, task_id, run_id,
+            summary=handoff_summary, outcome="completed",
+        )
     return True
 
 
@@ -3857,6 +3865,11 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
     _cleanup_workspace(conn, task_id)
+    if _kanban_observer_consumed("kanban_task_completed"):
+        _fire_task_hook(
+            "kanban_task_completed", get_task(conn, task_id), task_id, run_id,
+            summary=None, outcome="archived",
+        )
     return True
 
 
