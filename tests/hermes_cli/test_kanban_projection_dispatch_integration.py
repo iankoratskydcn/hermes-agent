@@ -102,5 +102,5 @@ def test_implicit_repo_survives_workspace_path_overwrite_on_respawn(kanban_home,
         assert task.workspace_path == str(projected)
         assert not (projected / ".git").exists()
 
-        respawned = kbd._projected_workspace(task, board=None, conn=conn)
+        respawned = kbd._projected_workspace(task, board=None)
         assert Path(respawned).joinpath("allowed.txt").read_text() == "v1"

@@ -1,3 +1,4 @@
+import hashlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -5,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli.kanban_ceiling import RoleCeiling, ScopeError, resolve_scope
-from hermes_cli.kanban_projection import MANIFEST_NAME, build_projection
+from hermes_cli.kanban_projection import build_projection
 
 
 def git_repo(tmp_path: Path) -> tuple[Path, str]:
@@ -46,13 +47,14 @@ def test_projection_has_only_granted_files_and_no_git(tmp_path):
     repo, sha = git_repo(tmp_path)
     scope = resolve_scope(SimpleNamespace(scope_paths=["src/pkg/**"]), RoleCeiling(frozenset({"src/**"})), repo=repo, base_sha=sha)
     dest = tmp_path / "projection"
-    build_projection(sha, scope, dest, repo=repo)
-    # The manifest is the only extra entry: a .git-free ingest diff needs it
-    # as a baseline for detecting adds/edits/deletes without git.
-    assert sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*")) == [
-        MANIFEST_NAME, "src", "src/pkg", "src/pkg/b.py",
-    ]
+    handle = build_projection(sha, scope, dest, repo=repo)
+    assert sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*")) == ["src", "src/pkg", "src/pkg/b.py"]
     assert not (dest / ".git").exists()
+    # The hash manifest a later .git-free ingest diff needs as a baseline is
+    # returned to the caller, never written inside the worker-controlled
+    # destination (a worker that can edit a file could edit an in-workspace
+    # manifest just as easily, hiding the tamper from the diff).
+    assert handle.manifest == {"src/pkg/b.py": hashlib.sha256(b"b").hexdigest()}
 
 
 def test_no_repo_clip_never_widens_past_ceiling():

@@ -12,13 +12,12 @@ import json
 import logging
 import os
 import signal
+import stat
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
-
-from hermes_cli.kanban_projection import MANIFEST_NAME
 
 _log = logging.getLogger(__name__)
 
@@ -91,18 +90,33 @@ def _validate(task: Any) -> tuple[bool, str]:
 
 
 def _diff_projected(workspace: Path) -> tuple[bool, tuple[str, ...], str]:
-    """Diff a .git-free projection workspace against its build-time manifest."""
-    manifest_path = workspace / MANIFEST_NAME
+    """Diff a .git-free projection workspace against its build-time manifest.
+
+    The manifest lives in a sidecar file next to (never inside) ``workspace``:
+    the workspace is the worker's own directory, and a worker that can edit a
+    file could just as easily edit an in-workspace manifest recording that
+    file's expected hash, silently defeating this diff.
+    """
+    manifest_path = workspace.parent / f".{workspace.name}.projection-manifest.json"
     try:
         baseline: dict[str, str] = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False, (), "projected workspace has no readable baseline manifest"
     current: dict[str, str] = {}
-    for root, _dirs, files in os.walk(workspace):
+    for root, _dirs, files in os.walk(workspace, followlinks=False):
         for name in files:
             path = Path(root, name)
             rel = path.relative_to(workspace).as_posix()
-            if rel == MANIFEST_NAME:
+            try:
+                mode = path.lstat().st_mode
+            except OSError:
+                return False, (), f"unable to stat workspace file for diff: {rel}"
+            if not stat.S_ISREG(mode):
+                # A worker-introduced symlink/FIFO/device: never open it (a FIFO
+                # or a device like /dev/zero can block or never hit EOF). Record
+                # it as changed so the write-scope check below judges it, rather
+                # than hanging trying to hash it.
+                current[rel] = f"non-regular:{stat.S_IFMT(mode)}"
                 continue
             digest = hashlib.sha256()
             try:

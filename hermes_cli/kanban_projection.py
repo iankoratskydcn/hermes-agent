@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import shutil
 import subprocess
 import tarfile
@@ -13,16 +12,18 @@ from typing import Any
 
 from hermes_cli.kanban_ceiling import Scope, ScopeError
 
-# Written alongside a projection's files so a later, .git-free ingest diff
-# (see kanban_ingest._diff) can detect adds/edits/deletes without git.
-MANIFEST_NAME = ".hermes_projection_manifest.json"
-
 
 @dataclass(frozen=True)
 class ProjectionHandle:
     path: Path
     base_sha: str
     paths: frozenset[str]
+    # sha256 per repo-relative path, as materialized. Callers needing a later
+    # .git-free ingest diff (see kanban_ingest._diff) must store this baseline
+    # somewhere the worker cannot write to — never inside ``path`` itself,
+    # since a worker that can edit a file can just as easily edit a manifest
+    # sitting in the same worker-controlled directory.
+    manifest: dict[str, str]
 
 
 def _validate_paths(paths: set[str] | frozenset[str]) -> list[str]:
@@ -114,8 +115,7 @@ def build_projection(base_sha: str, scope: Scope, dest: Path, *, repo: Any = "."
                     manifest[member_path.as_posix()] = digest.hexdigest()
                 else:
                     raise ScopeError("git archive contained an unsupported entry")
-        (destination / MANIFEST_NAME).write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
     except (tarfile.TarError, OSError) as exc:
         shutil.rmtree(destination, ignore_errors=True)
         raise ScopeError(f"could not extract projection: {exc}") from exc
-    return ProjectionHandle(destination, base_sha, frozenset(paths))
+    return ProjectionHandle(destination, base_sha, frozenset(paths), manifest)
