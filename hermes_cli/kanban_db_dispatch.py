@@ -1704,6 +1704,7 @@ def _retry_cap_gate_ok(board: Optional[str], task_id: str, consecutive_failures:
 
 def _projected_workspace(
     task: "Task", *, board: Optional[str], destination_root: Optional[Path] = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> Path:
     """Materialize a fresh, bounded workspace for a ``projected`` task.
 
@@ -1712,6 +1713,13 @@ def _projected_workspace(
     the task body, or use the board's ``projection`` object.  This makes a
     respawn re-derive the tree from the same pinned inputs and never trust a
     prior ``workspace_path`` (which is replaced with the projection path).
+
+    When no explicit ``projection.repo`` is configured, the task's current
+    ``workspace_path`` is used once as the implicit source and immediately
+    persisted into the task body (when ``conn`` is given), because dispatch
+    overwrites ``workspace_path`` with the projection destination right after
+    this call returns; without persisting it, a later respawn would try to
+    resolve the source repo from that now-.git-less projection directory.
     """
     from hermes_cli.kanban_ceiling import ScopeError, resolve_scope
     from hermes_cli.kanban_projection import build_projection
@@ -1721,19 +1729,21 @@ def _projected_workspace(
     if not isinstance(board_projection, dict):
         board_projection = {}
     task_projection: dict[str, Any] = {}
-    if task.body:
-        try:
-            body = json.loads(task.body)
-            if isinstance(body, dict) and isinstance(body.get("projection"), dict):
-                task_projection = body["projection"]
-        except (TypeError, ValueError):
-            pass
+    try:
+        body = json.loads(task.body) if task.body else {}
+    except (TypeError, ValueError):
+        body = {}
+    if isinstance(body, dict) and isinstance(body.get("projection"), dict):
+        task_projection = body["projection"]
     config = {**board_projection, **task_projection}
     repo_value = config.get("repo") or config.get("source_repo")
+    implicit_repo = False
     if not repo_value:
         # The initial workspace path is the source-repository contract.  Once
-        # persisted as a projection it must not be used as an implicit source.
+        # persisted as a projection it must not be used as an implicit source,
+        # so it is captured into the task body below before it is overwritten.
         repo_value = task.workspace_path
+        implicit_repo = True
     base_sha = config.get("base_sha") or metadata.get("projection_base_sha")
     ceiling = config.get("ceiling") or metadata.get("projection_ceiling")
     if not repo_value or not base_sha or not ceiling:
@@ -1754,6 +1764,14 @@ def _projected_workspace(
         shutil.rmtree(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     handle = build_projection(str(base_sha), scope, destination, repo=repo)
+    if implicit_repo and conn is not None:
+        # Only the repo is pinned here; base_sha/ceiling still re-resolve from
+        # board metadata (or task_projection, if later set explicitly) so a
+        # respawn keeps picking up the current pin rather than a frozen one.
+        task_projection["repo"] = str(repo)
+        body["projection"] = task_projection
+        with _kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (json.dumps(body), task.id))
     return handle.path
 
 
@@ -1856,7 +1874,7 @@ def _dispatch_lane_task(
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "projected":
-            workspace = _projected_workspace(claimed, board=board)
+            workspace = _projected_workspace(claimed, board=board, conn=conn)
         elif claimed.workspace_kind == "worktree":
             workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
         else:

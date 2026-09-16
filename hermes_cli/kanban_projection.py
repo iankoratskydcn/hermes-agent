@@ -1,7 +1,9 @@
 """Build a .git-free projection from a pinned git tree."""
 from __future__ import annotations
 
+import hashlib
 import io
+import json
 import shutil
 import subprocess
 import tarfile
@@ -10,6 +12,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from hermes_cli.kanban_ceiling import Scope, ScopeError
+
+# Written alongside a projection's files so a later, .git-free ingest diff
+# (see kanban_ingest._diff) can detect adds/edits/deletes without git.
+MANIFEST_NAME = ".hermes_projection_manifest.json"
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,7 @@ def build_projection(base_sha: str, scope: Scope, dest: Path, *, repo: Any = "."
     )
     if archive.returncode:
         raise ScopeError(f"git archive failed: {archive.stderr.decode(errors='replace').strip()}")
+    manifest: dict[str, str] = {}
     try:
         with tarfile.open(fileobj=io.BytesIO(archive.stdout), mode="r:") as tar:
             members = tar.getmembers()
@@ -98,11 +105,16 @@ def build_projection(base_sha: str, scope: Scope, dest: Path, *, repo: Any = "."
                     source = tar.extractfile(member)
                     if source is None:
                         raise ScopeError("git archive contained an unreadable file")
+                    digest = hashlib.sha256()
                     with target.open("wb") as output:
-                        shutil.copyfileobj(source, output)
+                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                            output.write(chunk)
                     target.chmod(member.mode & 0o777)
+                    manifest[member_path.as_posix()] = digest.hexdigest()
                 else:
                     raise ScopeError("git archive contained an unsupported entry")
+        (destination / MANIFEST_NAME).write_text(json.dumps(manifest, sort_keys=True))
     except (tarfile.TarError, OSError) as exc:
         shutil.rmtree(destination, ignore_errors=True)
         raise ScopeError(f"could not extract projection: {exc}") from exc

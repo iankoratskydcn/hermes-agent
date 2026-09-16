@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli.kanban_ceiling import RoleCeiling, ScopeError, resolve_scope
-from hermes_cli.kanban_projection import build_projection
+from hermes_cli.kanban_projection import MANIFEST_NAME, build_projection
 
 
 def git_repo(tmp_path: Path) -> tuple[Path, str]:
@@ -47,8 +47,19 @@ def test_projection_has_only_granted_files_and_no_git(tmp_path):
     scope = resolve_scope(SimpleNamespace(scope_paths=["src/pkg/**"]), RoleCeiling(frozenset({"src/**"})), repo=repo, base_sha=sha)
     dest = tmp_path / "projection"
     build_projection(sha, scope, dest, repo=repo)
-    assert sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*")) == ["src", "src/pkg", "src/pkg/b.py"]
+    # The manifest is the only extra entry: a .git-free ingest diff needs it
+    # as a baseline for detecting adds/edits/deletes without git.
+    assert sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*")) == [
+        MANIFEST_NAME, "src", "src/pkg", "src/pkg/b.py",
+    ]
     assert not (dest / ".git").exists()
+
+
+def test_no_repo_clip_never_widens_past_ceiling():
+    # Without repo/base_sha, a request wider than the ceiling ("**") must clip
+    # down to the ceiling's own pattern, never keep the wider request.
+    scope = resolve_scope(SimpleNamespace(scope_paths=["**"]), RoleCeiling(frozenset({"src/**"})))
+    assert scope.read == frozenset({"src/**"})
 
 
 def test_path_traversal_is_rejected(tmp_path):
