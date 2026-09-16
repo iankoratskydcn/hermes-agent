@@ -114,7 +114,7 @@ def build_projection(base_sha: str, scope: Scope, dest: Path, *, repo: Any = "."
                     manifest[member_path.as_posix()] = digest.hexdigest()
                 else:
                     raise ScopeError("git archive contained an unsupported entry")
-        (destination / MANIFEST_NAME).write_text(json.dumps(manifest, sort_keys=True))
+        (destination / MANIFEST_NAME).write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
     except (tarfile.TarError, OSError) as exc:
         shutil.rmtree(destination, ignore_errors=True)
         raise ScopeError(f"could not extract projection: {exc}") from exc

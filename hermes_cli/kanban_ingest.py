@@ -94,7 +94,7 @@ def _diff_projected(workspace: Path) -> tuple[bool, tuple[str, ...], str]:
     """Diff a .git-free projection workspace against its build-time manifest."""
     manifest_path = workspace / MANIFEST_NAME
     try:
-        baseline: dict[str, str] = json.loads(manifest_path.read_text())
+        baseline: dict[str, str] = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False, (), "projected workspace has no readable baseline manifest"
     current: dict[str, str] = {}
