@@ -61,16 +61,49 @@ test('isolates active routes by webContents id', () => {
   assert.equal(routes.get(22)?.connectionId, 'source-b')
 })
 
-test('invalid publications clear only the sender route', () => {
+test('a transient disconnect (null publish) keeps the window pinned to its last route', () => {
   const routes = new WindowConnectionRouteRegistry()
 
   routes.set(11, { connectionId: 'source-a', profile: 'default', registryScoped: true })
   routes.set(22, { connectionId: 'source-b', profile: 'worker', registryScoped: true })
 
+  // A reconnect/poll blip publishes null (no connection object yet) — this must
+  // not erase which session window 11 is pinned to, or the next resolution
+  // falls through to whatever profile is currently "primary" instead of the
+  // one this window actually connected under.
   routes.set(11, null)
 
-  assert.equal(routes.get(11), null)
+  assert.equal(routes.get(11)?.connectionId, 'source-a')
   assert.equal(routes.get(22)?.connectionId, 'source-b')
+})
+
+test('connected session identity stays constant across reconnects even as new sibling sessions appear', () => {
+  const routes = new WindowConnectionRouteRegistry()
+
+  routes.set(11, { connectionId: 'worker-1', profile: 'kanban-a', registryScoped: true })
+
+  // Sibling Kanban worker sessions spin up and reconnect-poll after window 11
+  // connected. None of this may retarget window 11's pinned identity.
+  routes.set(22, { connectionId: 'worker-2', profile: 'kanban-b', registryScoped: true })
+  routes.set(11, null) // window 11's own reconnect poll blip
+  routes.set(33, { connectionId: 'worker-3', profile: 'kanban-c', registryScoped: true })
+  routes.set(11, null) // another blip, after even newer siblings exist
+
+  assert.equal(routes.get(11)?.connectionId, 'worker-1')
+  assert.equal(routes.get(11)?.profile, 'kanban-a')
+})
+
+test('only window teardown clears a pinned route', () => {
+  const routes = new WindowConnectionRouteRegistry()
+
+  routes.set(11, { connectionId: 'source-a', profile: 'default', registryScoped: true })
+  routes.set(11, null)
+
+  assert.equal(routes.get(11)?.connectionId, 'source-a')
+
+  routes.delete(11)
+
+  assert.equal(routes.get(11), null)
 })
 
 test('routes a non-primary SSH connection independently from another window', () => {

@@ -71,9 +71,12 @@ export class WindowConnectionRouteRegistry {
     const route = normalizeWindowConnectionRoute(value)
 
     if (!route) {
-      this.routes.delete(webContentsId)
-
-      return null
+      // A null publish is a transient disconnect (reconnect/poll blip with no
+      // connection object yet), not a window closing — keep the window pinned
+      // to whatever it last resolved so a reconnect never falls through to
+      // "whichever profile is currently primary". Only delete() (called on
+      // the sender's 'destroyed' event) actually clears a route.
+      return this.routes.get(webContentsId) ?? null
     }
 
     this.routes.set(webContentsId, route)
