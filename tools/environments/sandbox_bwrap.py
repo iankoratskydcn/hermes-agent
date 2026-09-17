@@ -12,6 +12,7 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -24,12 +25,13 @@ _LANDLOCK_ADD_RULE = 445
 _LANDLOCK_RESTRICT_SELF = 446
 _LANDLOCK_CREATE_RULESET_VERSION = 1
 _LANDLOCK_RULE_TYPE_PATH_BENEATH = 1
-_LANDLOCK_ACCESS_FS_READ = (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)
-_LANDLOCK_ACCESS_FS_WRITE = (1 << 0) | (1 << 1) | (1 << 8) | (1 << 9) | (1 << 10)
+_LANDLOCK_ACCESS_FS_READ = (1 << 0) | (1 << 2) | (1 << 3)
+_LANDLOCK_ACCESS_FS_WRITE = sum(1 << bit for bit in range(1, 13))
 
 
 class _PathBeneath(ctypes.Structure):
-    _fields_ = [("parent_fd", ctypes.c_int), ("allowed_access", ctypes.c_uint64)]
+    # Kernel ABI order is u64 allowed_access followed by s32 parent_fd.
+    _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int)]
 
 
 class SandboxUnavailable(RuntimeError):
@@ -132,7 +134,7 @@ def apply_landlock(*, ro_paths: list[str], rw_paths: list[str],
             access = _LANDLOCK_ACCESS_FS_READ
             if path in rw_paths:
                 access |= _LANDLOCK_ACCESS_FS_WRITE
-            rule = _PathBeneath(parent_fd, access)
+            rule = _PathBeneath(access, parent_fd)
             if syscall(_LANDLOCK_ADD_RULE, fd, _LANDLOCK_RULE_TYPE_PATH_BENEATH,
                        ctypes.byref(rule), 0) < 0:
                 raise SandboxUnavailable(f"Landlock rule installation failed (errno {ctypes.get_errno()})")
@@ -164,7 +166,7 @@ def build_bwrap_argv(*, read_paths: list[str], write_paths: list[str],
     if not cmd:
         raise ValueError("sandbox command must not be empty")
     argv = [shutil.which("bwrap") or "bwrap", "--unshare-all",
-            "--disable-userns", "--die-with-parent", "--new-session",
+            "--unshare-user", "--disable-userns", "--die-with-parent", "--new-session",
             "--clearenv", "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
             "--setenv", "HOME", "/work", "--setenv", "TERM",
             os.environ.get("TERM", "dumb"), "--proc", "/proc", "--dev", "/dev",
@@ -182,10 +184,36 @@ def build_bwrap_argv(*, read_paths: list[str], write_paths: list[str],
 
 def build_landlock_wrapper_argv(*, ro_paths: list[str], rw_paths: list[str],
                                 cmd: list[str]) -> list[str]:
-    """Return *cmd* unchanged until the native Landlock exec shim is shipped.
+    """Return an argv that installs Landlock before executing *cmd*.
 
-    Capability gating remains active now; this explicit seam prevents callers from
-    mistaking a future shim's absence for an enforced policy.
+    Bubblewrap is the existing launcher boundary.  Its ``--`` command is already
+    the child process that must be confined, so prepend a tiny Python shim that
+    applies the ruleset in-process and then ``execv``s the original command.
     """
-    del ro_paths, rw_paths
-    return list(cmd)
+    if not cmd:
+        raise ValueError("sandbox command must not be empty")
+    shim = (
+        "import os,sys; "
+        "from tools.environments.sandbox_bwrap import apply_landlock; "
+        "apply_landlock(ro_paths=sys.argv[1].split(os.pathsep) if sys.argv[1] else [], "
+        "rw_paths=sys.argv[2].split(os.pathsep) if sys.argv[2] else []); "
+        "os.execv(sys.argv[3], sys.argv[3:])"
+    )
+    ro_arg = os.pathsep.join(str(Path(p)) for p in ro_paths if p)
+    rw_arg = os.pathsep.join(str(Path(p)) for p in rw_paths if p)
+    separator = cmd.index("--")
+    child = cmd[separator + 1:]
+    if not child:
+        raise ValueError("sandbox command must not be empty")
+    interpreter = str(Path(sys.executable).resolve())
+    interpreter_dir = str(Path(interpreter).parent)
+    interpreter_real_dir = str(Path(interpreter).resolve().parent)
+    interpreter_prefix = str(Path(interpreter_real_dir).parent)
+    launcher = list(cmd[:separator])
+    for path in (interpreter_dir, interpreter_real_dir, interpreter_prefix):
+        if path not in ro_paths and path not in rw_paths:
+            launcher += ["--ro-bind", path, path]
+    return [
+        *launcher, "--", interpreter, "-c", shim,
+        ro_arg, rw_arg, child[0], *child[1:]
+    ]

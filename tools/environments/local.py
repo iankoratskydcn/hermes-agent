@@ -908,11 +908,6 @@ class LocalEnvironment(BaseEnvironment):
                 raise sandbox_bwrap.SandboxUnavailable(
                     "sandbox required but local bubblewrap is unavailable on Windows")
             sandbox_bwrap.require_capabilities()
-            # The Landlock syscalls exist, but this process cannot install them
-            # in the child via an argv-only wrapper.  Refuse rather than claim
-            # enforcement while executing without it.
-            raise sandbox_bwrap.SandboxUnavailable(
-                "sandbox required but Landlock exec shim is not available")
         if _IS_WINDOWS:
             return args
         if not sandbox_bwrap.bwrap_available():
