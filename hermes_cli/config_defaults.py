@@ -1789,6 +1789,10 @@ DEFAULT_CONFIG = {
         # gating with no escape valve would permanently strand tasks on any board that
         # hasn't adopted decision-hud, or during a decision-hud outage.
         "retry_cap_escalation_enabled": False,
+        # Route re-queued needs_input/scope blockers through a single unresolved
+        # Decision HUD missing_constraint card before respawn. Opt-in because
+        # fail-closed HUD gating can intentionally park a board during outages.
+        "blocker_decision_escalation_enabled": False,
         # Profile for the root/orchestration task after Triage decomposition; "" = default profile.
         # Does not control the decomposer LLM path (see auxiliary.kanban_decomposer).
         "orchestrator_profile": "",

@@ -65,7 +65,10 @@ def fresh_home(tmp_path, monkeypatch):
     # these tests exercise the gate itself, so opt in explicitly.
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
-        lambda: {"kanban": {"retry_cap_escalation_enabled": True}},
+        lambda: {"kanban": {
+            "retry_cap_escalation_enabled": True,
+            "blocker_decision_escalation_enabled": True,
+        }},
     )
     return home
 
@@ -212,6 +215,23 @@ class TestRule4MissingConstraintEscalation:
         )
         assert after.status == "running"
 
+    def test_requeued_needs_input_pushes_one_constraint_card(self, fresh_home):
+        _require_decision_hud_installed()
+        project, task_id = self._setup(project="proj-blocker")
+        with kbc.connect(board=project) as conn:
+            assert kb.block_task(
+                conn, task_id, reason="owner policy is unresolved", kind="needs_input",
+            )
+            assert kb.unblock_task(conn, task_id)
+            result = kbd.dispatch_once(conn, board=project, spawn_fn=_no_spawn)
+            after = kb.get_task(conn, task_id)
+
+        rows = _missing_constraint_rows(project, task_id)
+        assert rows and len(rows) == 1
+        assert result.spawned == []
+        assert any(task_id == tid for tid, _ in result.retry_cap_blocked)
+        assert after is not None and after.status == "ready"
+
     def test_one_or_two_failures_not_gated_by_rule4(self, fresh_home):
         _require_decision_hud_installed()
         project, task_id = self._setup()
@@ -299,3 +319,4 @@ def test_retry_cap_escalation_enabled_defaults_to_false_in_real_config():
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 
     assert DEFAULT_CONFIG["kanban"]["retry_cap_escalation_enabled"] is False
+    assert DEFAULT_CONFIG["kanban"]["blocker_decision_escalation_enabled"] is False

@@ -1872,24 +1872,19 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
-def _retry_cap_gate_ok(board: Optional[str], task_id: str, consecutive_failures: int) -> tuple[bool, str]:
+def _retry_cap_gate_ok(
+    board: Optional[str], task_id: str, consecutive_failures: int,
+    *, conn: Optional[sqlite3.Connection] = None,
+) -> tuple[bool, str]:
     """Rule 4 (no-infinite-retry) per-task gate. Returns ``(True, "")`` when
     the task is clear to dispatch; ``(False, reason)`` when it must be
     refused this tick.
 
-    Below :data:`RETRY_CAP_ESCALATION_THRESHOLD` this is always a no-op
-    ``(True, "")`` — the ordinary breaker (``_record_task_failure`` /
-    ``DEFAULT_FAILURE_LIMIT`` / per-task ``max_retries``) is the only
-    mechanism that applies there, unchanged.
-
-    At or above the threshold: check whether a decision-hud
-    ``missing_constraint`` card is already resolved for this exact
-    ``(project, task_id)`` FIRST — a resolved row must re-enable dispatch,
-    not trigger a fresh push-then-recheck that would re-open a brand-new
-    unresolved row every tick. Only when still unresolved do we push a
-    ``missing_constraint`` card via ``push_task_missing_constraint`` (a
-    no-op, not an error, when one is already open per the bridge's
-    documented duplicate handling).
+    Below :data:`RETRY_CAP_ESCALATION_THRESHOLD` this is always a no-op for
+    ordinary failures. When ``kanban.blocker_decision_escalation_enabled`` is
+    true, a task re-queued after a typed ``needs_input`` or ``scope`` block is
+    also gated here, without waiting for another crash. Both paths use the
+    same idempotent missing_constraint card and resolution check.
 
     Same fail-closed contract as ``check_batch_approval``: a ``project``
     that cannot be resolved, or any decision-hud error/unavailability, is
@@ -1912,10 +1907,19 @@ def _retry_cap_gate_ok(board: Optional[str], task_id: str, consecutive_failures:
             kanban_cfg = {}
     except Exception:
         kanban_cfg = {}
-    if not kanban_cfg.get("retry_cap_escalation_enabled", False):
+    retry_enabled = bool(kanban_cfg.get("retry_cap_escalation_enabled", False))
+    blocker_enabled = bool(kanban_cfg.get("blocker_decision_escalation_enabled", False))
+    if not retry_enabled and not blocker_enabled:
         return True, ""
-    if consecutive_failures < RETRY_CAP_ESCALATION_THRESHOLD:
+
+    task_row = conn.execute(
+        "SELECT block_kind FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone() if conn is not None else None
+    block_kind = task_row["block_kind"] if task_row is not None else None
+    typed_block = blocker_enabled and block_kind in {"needs_input", "scope"}
+    if not typed_block and (not retry_enabled or consecutive_failures < RETRY_CAP_ESCALATION_THRESHOLD):
         return True, ""
+
     project = _kb.read_board_metadata(board=board).get("project_id")
     if not project:
         return False, f"board {_kb._slug_or_default(board)!r} has no project_id mapped"
@@ -1934,6 +1938,9 @@ def _retry_cap_gate_ok(board: Optional[str], task_id: str, consecutive_failures:
     except Exception as exc:
         return False, f"missing_constraint resolution check failed: {exc}"
     question = (
+        f"Task {task_id!r} is re-queued after a {block_kind or 'retry'} blocker. "
+        "What constraint/spec is missing, or how should it proceed?"
+        if typed_block else
         f"Task {task_id!r} has failed {consecutive_failures} consecutive times. "
         "What constraint/spec is missing, or how should it proceed?"
     )
@@ -1944,6 +1951,11 @@ def _retry_cap_gate_ok(board: Optional[str], task_id: str, consecutive_failures:
     except Exception as exc:
         return False, f"missing_constraint push failed: {exc}"
     if pushed:
+        if typed_block:
+            return False, (
+                f"task {task_id!r} re-queued after {block_kind} blocker; "
+                "pushed a decision-hud missing_constraint card, awaiting PO resolution"
+            )
         return False, (
             f"task {task_id!r} hit {consecutive_failures} consecutive failures; "
             "pushed a decision-hud missing_constraint card, awaiting PO resolution"
@@ -2110,7 +2122,9 @@ def _dispatch_lane_task(
         "SELECT consecutive_failures FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     consecutive_failures = int(failures_row["consecutive_failures"]) if failures_row is not None else 0
-    retry_ok, retry_reason = _retry_cap_gate_ok(board, task_id, consecutive_failures)
+    retry_ok, retry_reason = _retry_cap_gate_ok(
+        board, task_id, consecutive_failures, conn=conn,
+    )
     if not retry_ok:
         result.retry_cap_blocked.append((task_id, retry_reason))
         if not dry_run:
