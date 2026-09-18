@@ -22,6 +22,13 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    # Proactively move to the next configured provider when rolling account quota is nearly exhausted.
+    # Unknown quota data does not trigger a switch; recovery uses hysteresis after fresh evidence.
+    "account_quota_failover": {
+        "enabled": True,
+        "switch_at_percent": 98.0,
+        "recover_below_percent": 80.0,
+    },
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # journal_mode: SQLite journal mode for every Hermes DB. "wal" default; use "delete" on

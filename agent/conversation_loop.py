@@ -37,7 +37,7 @@ from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from agent.turn_retry_state import TurnRetryState
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
 # skewed phase mid-turn.
-from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
+from agent.turn_api_call import account_quota_guard, handle_api_interrupt, nous_rate_limit_guard, perform_api_call
 from agent.turn_api_error import handle_api_error
 from agent.turn_api_request import build_api_request
 from agent.turn_failure_copy import site_copy
@@ -1400,6 +1400,11 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
     Returns a turn result dict when a phase ends the turn, else None once the loop is left
     (success, a restart armed on ``s._retry``, interrupt, or retries exhausted)."""
     while s.retry_count < s.max_retries:
+        _aq = _run_phase(account_quota_guard, agent, s)
+        if _aq.action == "return":
+            return _aq.result
+        if _aq.action == "break":
+            return None
         _ng = _run_phase(nous_rate_limit_guard, agent, s)
         if _ng.action == "return":
             return _ng.result

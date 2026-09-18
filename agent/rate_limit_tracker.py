@@ -105,6 +105,17 @@ def parse_rate_limit_headers(headers: Mapping[str, str], provider: str = "") -> 
     return RateLimitState(captured_at=now, provider=provider, **buckets)
 
 
+def max_usage_percent(state: object) -> Optional[float]:
+    """Highest known rolling request/token bucket usage, or None without data."""
+    buckets = ("requests_min", "requests_hour", "tokens_min", "tokens_hour")
+    values = [
+        float(getattr(getattr(state, name, None), "usage_pct"))
+        for name in buckets
+        if getattr(getattr(state, name, None), "limit", 0) > 0
+    ]
+    return max(values) if values else None
+
+
 # ── Formatting ──────────────────────────────────────────────────────────
 
 

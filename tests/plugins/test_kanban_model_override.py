@@ -84,6 +84,32 @@ def test_set_and_clear_model_override(conn):
     assert t.provider_override is None
 
 
+def test_route_change_clears_stale_retry_guard(conn):
+    tid = kb.create_task(conn, title="t", assignee="worker")
+    conn.execute(
+        "UPDATE tasks SET consecutive_failures = 2, last_failure_error = ? WHERE id = ?",
+        ("429 quota exhausted", tid),
+    )
+    assert kb.set_model_override(conn, tid, "gpt-5.6-luna-900k", provider="openai-codex")
+    task = kb.get_task(conn, tid)
+    assert task.consecutive_failures == 0
+    assert task.last_failure_error is None
+    event = next(e for e in kb.list_events(conn, tid) if e.kind == "model_override_set")
+    assert event.payload["cleared_retry_guard"] is True
+
+
+def test_repeating_route_does_not_clear_failure_evidence(conn):
+    tid = kb.create_task(conn, title="t", assignee="worker", model_override="gpt", provider_override="openai")
+    conn.execute(
+        "UPDATE tasks SET consecutive_failures = 1, last_failure_error = ? WHERE id = ?",
+        ("real task failure", tid),
+    )
+    assert kb.set_model_override(conn, tid, "gpt", provider="openai")
+    task = kb.get_task(conn, tid)
+    assert task.consecutive_failures == 1
+    assert task.last_failure_error == "real task failure"
+
+
 def test_provider_without_model_rejected(conn):
     tid = kb.create_task(conn, title="t", assignee="worker")
     with pytest.raises(ValueError):

@@ -8,6 +8,7 @@ from agent.rate_limit_tracker import (
     parse_rate_limit_headers,
     format_rate_limit_display,
     format_rate_limit_compact,
+    max_usage_percent,
     _fmt_count,
     _fmt_seconds,
     _bar,
@@ -74,12 +75,26 @@ class TestBucket:
         # ~50 seconds should remain
         assert 49 <= b.remaining_seconds_now <= 51
 
+    def test_max_usage_percent_uses_highest_known_bucket(self):
+        from types import SimpleNamespace
+
+        state = SimpleNamespace(
+            requests_min=SimpleNamespace(limit=100, usage_pct=40.0),
+            requests_hour=SimpleNamespace(limit=100, usage_pct=98.0),
+            tokens_min=SimpleNamespace(limit=0, usage_pct=0.0),
+            tokens_hour=SimpleNamespace(limit=100, usage_pct=80.0),
+        )
+        assert max_usage_percent(state) == 98.0
+
+    def test_max_usage_percent_is_unknown_without_buckets(self):
+        assert max_usage_percent(object()) is None
+
+
+
+
 
 
 class TestFormatting:
-
-
-
     def test_fmt_seconds_short(self):
         assert _fmt_seconds(45) == "45s"
         assert _fmt_seconds(0) == "0s"

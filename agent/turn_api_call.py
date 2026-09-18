@@ -217,6 +217,69 @@ class NousRateGuardVerdict:
     result: Optional[Dict[str, Any]] = None
 
 
+def account_quota_guard(
+    agent: Any, *, _retry: Any, api_messages: Any, messages: Any, conversation_history: Any,
+    active_system_prompt: Any, retry_count: Any, compression_attempts: Any, api_call_count: Any,
+) -> NousRateGuardVerdict:
+    """Switch at a configured account-quota threshold before issuing another request."""
+    from agent.conversation_loop import _arm_fallback_restart
+    from agent.rate_limit_tracker import max_usage_percent
+    from hermes_cli.config import load_config_readonly
+
+    def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> NousRateGuardVerdict:
+        return NousRateGuardVerdict(
+            action=action, active_system_prompt=active_system_prompt, retry_count=retry_count,
+            compression_attempts=compression_attempts, result=result,
+        )
+
+    try:
+        settings = (load_config_readonly() or {}).get("account_quota_failover") or {}
+        if not settings.get("enabled", True):
+            return _verdict("fallthrough")
+        switch_at = float(settings.get("switch_at_percent", 98.0))
+        recover_below = float(settings.get("recover_below_percent", 80.0))
+        if not 80.0 <= switch_at <= 99.0 or not 0.0 <= recover_below < switch_at:
+            raise ValueError("invalid account_quota_failover thresholds")
+        state = getattr(agent, "_rate_limit_state", None)
+        state_provider = str(getattr(state, "provider", "") or "").strip().lower()
+        if state_provider and state_provider != str(agent.provider or "").strip().lower():
+            return _verdict("fallthrough")
+        usage = max_usage_percent(state)
+        route_key = (str(agent.provider or "").strip().lower(), str(agent.model or "").strip())
+        quarantined = getattr(agent, "_account_quota_quarantined_routes", None)
+        if quarantined is None:
+            quarantined = agent._account_quota_quarantined_routes = set()
+        if route_key in quarantined:
+            if usage is not None and usage <= recover_below:
+                quarantined.discard(route_key)
+                return _verdict("fallthrough")
+        elif usage is None or usage < switch_at:
+            return _verdict("fallthrough")
+        quarantined.add(route_key)
+        usage_label = f"{usage:.1f}%" if usage is not None else "unknown"
+        message = (
+            f"Account quota for {agent.provider}/{agent.model} is at {usage_label} "
+            f"(threshold {switch_at:.1f}%). Trying fallback."
+        )
+        agent._buffer_vprint(f"⚠️ {message}")
+        agent._buffer_diagnostic_status(f"⚠️ {message}")
+        if agent._try_activate_fallback(reason=FailoverReason.rate_limit):
+            active_system_prompt = _arm_fallback_restart(
+                agent, api_messages, active_system_prompt, _retry)
+            retry_count = compression_attempts = 0
+            return _verdict("break")
+        agent._flush_status_buffer()
+        agent._persist_session(messages, conversation_history)
+        return _verdict("return", stamp_failure({
+            "final_response": f"⚠️ {message} No fallback route is configured.",
+            "messages": messages, "api_calls": api_call_count, "completed": False,
+            "failed": True, "error": message,
+        }, FailoverReason.rate_limit.value, True))
+    except Exception:
+        logger.warning("Account quota failover unavailable; continuing without proactive switch", exc_info=True)
+        return _verdict("fallthrough")
+
+
 def nous_rate_limit_guard(
     agent: Any, *, _retry: Any, api_messages: Any, messages: Any, conversation_history: Any,
     active_system_prompt: Any, retry_count: Any, compression_attempts: Any, api_call_count: Any,

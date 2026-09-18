@@ -1798,16 +1798,38 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 def set_model_override(
     conn: sqlite3.Connection, task_id: str, model: Optional[str], provider: Optional[str] = None,
 ) -> bool:
-    """Set (empty ``model`` clears BOTH) the per-task model/provider override.
-    Allowed while ``running``: it applies on the NEXT dispatch, which is the
-    rate-limit-recovery flow (set, then reclaim/retry)."""
+    """Set a per-task model/provider override for the next dispatch.
+
+    Changing the route starts a fresh retry boundary: failures from the old provider
+    must not strand the task behind its quota/auth respawn guard.
+    """
     model, provider = _validate_model_override(model, provider)
-    return _set_task_override(
-        conn, task_id,
-        "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?", (model, provider),
-        "model_override_set", {"model": model, "provider": provider},
-        ("model_override", "provider_override"), archived_msg="cannot set model override",
-    )
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, model_override, provider_override FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] == "archived":
+            raise RuntimeError(f"cannot set model override on archived task {task_id}")
+        changed = (row["model_override"], row["provider_override"]) != (model, provider)
+        if changed:
+            conn.execute(
+                "UPDATE tasks SET model_override = ?, provider_override = ?, "
+                "consecutive_failures = 0, last_failure_error = NULL WHERE id = ?",
+                (model, provider, task_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
+                (model, provider, task_id),
+            )
+        _append_event(conn, task_id, "model_override_set", {
+            "model": model, "provider": provider, "cleared_retry_guard": changed,
+        })
+    notify_task_updated(conn, task_id, ("model_override", "provider_override"))
+    return True
 
 
 def _set_task_override(

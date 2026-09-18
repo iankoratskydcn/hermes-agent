@@ -264,6 +264,37 @@ class TestIsGenuineNousRateLimit:
 
 
 
+
+
+class TestAccountQuotaGuard:
+    def test_threshold_stops_request_without_fallback(self, monkeypatch):
+        from types import SimpleNamespace
+        from agent.turn_api_call import account_quota_guard
+
+        state = SimpleNamespace(
+            provider="anthropic",
+            requests_min=SimpleNamespace(limit=100, usage_pct=98.0),
+            requests_hour=SimpleNamespace(limit=0, usage_pct=0.0),
+            tokens_min=SimpleNamespace(limit=0, usage_pct=0.0),
+            tokens_hour=SimpleNamespace(limit=0, usage_pct=0.0),
+        )
+        agent = SimpleNamespace(
+            provider="anthropic", model="claude", _rate_limit_state=state,
+            _try_activate_fallback=lambda **_kwargs: False,
+            _buffer_vprint=lambda _text: None,
+            _buffer_diagnostic_status=lambda _text: None,
+            _flush_status_buffer=lambda: None,
+            _persist_session=lambda *_args: None,
+        )
+        verdict = account_quota_guard(
+            agent, _retry=None, api_messages=[], messages=[], conversation_history=[],
+            active_system_prompt="system", retry_count=0, compression_attempts=0,
+            api_call_count=0,
+        )
+        assert verdict.action == "return"
+        assert "98.0%" in verdict.result["final_response"]
+
+
 class TestWelcomeRouteCopy:
     @staticmethod
     def _drive_guard(base_url, monkeypatch):
