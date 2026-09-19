@@ -541,8 +541,10 @@ DEFAULT_CONFIG = {
         # above 0.75 to override the floor.
         "threshold": 0.50,
         # threshold_tokens: absolute token cap — compression triggers at the lower of the ratio
-        # threshold and this count. Clamped to the model's context length.
-        "threshold_tokens": None,
+        # threshold and this count. Clamped to the model's context length. 256K bounds 1M-window
+        # models (their 50% trigger sat at 500K, so compaction never fired) while every lower
+        # ratio trigger still wins; null = ratio-only.
+        "threshold_tokens": 256_000,
         # "progress_notices": False,    # opt-in (#52995): when True, routine compression
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         # tail_mode: "lean" = clamped 2.5%-of-window tail (10K floor / 25K cap) plus chunked
@@ -1275,10 +1277,10 @@ DEFAULT_CONFIG = {
         "request_overrides": {},
         # compression_threshold_tokens: optional absolute cap on a subagent's compaction TRIGGER
         # (not the request payload), applied as the lower of this and the child's ratio threshold.
-        # 0 (default) = no subagent-specific cap; children compact at the same 0.50 x window as the
-        # parent (500K on a 1M model). A replay of a 1,393-agent run showed 200K-400K caps within
-        # 5% of each other in cost once cache prefixes are intact, and every compaction is a
-        # chance to lose detail, so the default stays off. A token count >= 16000 enables it;
+        # 0 (default) = no subagent-specific cap; children compact where the parent does — the lower
+        # of 0.50 x window and the global compression.threshold_tokens cap. A replay of a 1,393-agent
+        # run showed 200K-400K caps within 5% of each other in cost once cache prefixes are intact,
+        # and every compaction is a chance to lose detail, so the default stays off. A token count >= 16000 enables it;
         # other values (true, "200k") are config errors: warned and ignored.
         "compression_threshold_tokens": 0,
         # When delegate_task narrows child toolsets, keep the parent's enabled MCP toolsets (so
@@ -1423,17 +1425,19 @@ DEFAULT_CONFIG = {
         # aux-model cost. `hermes curator run --consolidate` overrides once.
         "consolidate": False,
         # Also prune bundled built-ins (a suppression list stops `hermes update` restoring them);
-        # hub-installed skills are NEVER pruned. A built-in's clock starts when the curator first
-        # sees it, so never a mass-prune on the first run. false = keep all.
-        "prune_builtins": True,
+        # hub-installed skills are NEVER pruned. OFF by default: shipped skills vanishing from
+        # `skills_list` because nobody loaded them for 30 days surprised people (57 gone in one
+        # startup tick). true = built-ins age out like agent-created skills.
+        "prune_builtins": False,
         # TTL purge of skills/.archive/: 0 = never; > 0 lets the explicit `hermes curator purge`
         # delete older archived skills (never automatic; logged in the ledger).
         "archive_ttl_days": 0,
-        # Before every real (non-dry-run) pass, snapshot ~/.hermes/skills/ to
-        # ~/.hermes/skills/.curator_backups/<utc-iso>/skills.tar.gz (`hermes curator rollback`).
+        # Before a consolidation pass (the only one that rewrites skill content in place), snapshot
+        # ~/.hermes/skills/ to ~/.hermes/skills/.curator_backups/<utc-iso>/skills.tar.gz (`hermes curator
+        # rollback`). The prune-only pass just moves directories into .archive/ and takes none.
         "backup": {
             "enabled": True,
-            "keep": 5,  # retain last N regular snapshots
+            "keep": 2,  # retain last N regular snapshots
         },
     },
     # Honcho AI-native memory — ~/.honcho/config.json is the source of truth (apiKey, workspace,
@@ -1459,6 +1463,9 @@ DEFAULT_CONFIG = {
         "free_response_channels": "",  # comma-separated channel IDs answered without mention
         "allowed_channels": "",  # if set, ONLY respond in these channel IDs (whitelist)
         "auto_thread": True,  # auto-create threads on @mention in channels (like Slack)
+        # Free-response channels reply inline by default; true also gives each top-level
+        # message in them its own thread (still mention-free). Env: DISCORD_FREE_RESPONSE_AUTO_THREAD.
+        "free_response_auto_thread": False,
         "thread_require_mention": False,  # require @mention in threads too (multi-bot threads)
         # Bot authors must type @thisbot to trigger a reply; Discord reply pings alone do not count.
         # Set False only for trusted legacy relays. Humans are unaffected.
