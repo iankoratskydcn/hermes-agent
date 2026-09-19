@@ -921,12 +921,7 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
-<<<<<<< HEAD
-    "ears_sentence", "task_mode", "role", "card_class",
-=======
-    "ears_sentence", "task_mode", "obligations", "feedback_schema", "role", "card_class",
->>>>>>> 059d888216 (feat(kanban): add sandboxed contract test tool and obligation matrix)
+    "ears_sentence", "task_mode", "role", "card_class", "obligations", "feedback_schema",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1477,6 +1472,7 @@ def create_task(
     scope_paths: Optional[Iterable[str]] = None,
     role: Optional[str] = None, card_class: Optional[str] = None,
     scope_manifest: Optional[dict] = None,
+    obligations: Optional[Iterable[str]] = None, feedback_schema: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1531,6 +1527,7 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
     scope_paths_list = list(scope_paths) if scope_paths is not None else None
+    obligations_list = list(obligations) if obligations is not None else None
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1578,8 +1575,12 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract,
-                        ears_sentence, scope_paths, role, card_class, scope_manifest
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ears_sentence, scope_paths, role, card_class, scope_manifest,
+                        obligations, feedback_schema
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                             ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1594,6 +1595,8 @@ def create_task(
                         role.strip() if isinstance(role, str) and role.strip() else None,
                         card_class.strip() if isinstance(card_class, str) and card_class.strip() else None,
                         json.dumps(scope_manifest, ensure_ascii=False) if scope_manifest is not None else None,
+                        json.dumps(obligations_list, ensure_ascii=False) if obligations_list is not None else None,
+                        feedback_schema.strip() if isinstance(feedback_schema, str) and feedback_schema.strip() else None,
                     ),
                 )
                 for pid in parents:

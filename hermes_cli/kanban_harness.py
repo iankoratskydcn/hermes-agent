@@ -8,9 +8,23 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+
+_REQ_ID = re.compile(r"REQ-[A-Z][A-Z0-9]*(?:[-_][A-Z0-9]+)*\Z")
+
+
+def _validated_obligations(obligations: list[str]) -> list[str]:
+    """Accept only the frozen requirement-ID vocabulary used by contract cards."""
+    if not isinstance(obligations, list) or not obligations:
+        raise HarnessError("contract-test obligations are unavailable")
+    values = [str(item) for item in obligations]
+    if len(set(values)) != len(values) or any(not _REQ_ID.fullmatch(value) for value in values):
+        raise HarnessError("contract-test obligations contain an invalid requirement ID")
+    return values
 
 
 class HarnessError(RuntimeError):
@@ -53,8 +67,7 @@ def sanitize(report: Mapping[str, Any], obligations: list[str], schema: str = "m
     """
     if not isinstance(report, Mapping):
         raise HarnessError("contract-test report has invalid shape")
-    if not isinstance(obligations, list) or not obligations:
-        raise HarnessError("contract-test obligations are unavailable")
+    obligations = _validated_obligations(obligations)
     if schema == "full":
         raise HarnessError("full feedback is not available for contract tests")
     if schema not in {"matrix", "obligations", ""}:
@@ -101,8 +114,7 @@ def run_harness(task_id: str, snapshot_path: str, obligations: list[str], *,
     existing DockerEnvironment and adds no sandbox implementation.
     """
     del task_id
-    if not isinstance(obligations, list) or any(not str(item).strip() for item in obligations):
-        raise HarnessError("obligations must be a non-empty list of identifiers")
+    obligations = _validated_obligations(obligations)
     with tempfile.TemporaryDirectory(prefix="hermes-contract-") as tmp:
         report_path = str(Path(tmp) / "report.json")
         runner = executor or _default_executor

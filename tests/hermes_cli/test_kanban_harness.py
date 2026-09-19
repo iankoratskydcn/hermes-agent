@@ -1,4 +1,4 @@
-from hermes_cli.kanban_harness import obligation_matrix, sanitize, run_harness
+from hermes_cli.kanban_harness import HarnessError, obligation_matrix, sanitize, run_harness
 
 
 def test_obligation_matrix_ands_multiple_tests_and_fails_missing():
@@ -47,3 +47,13 @@ def test_run_harness_canary_in_failed_assertion_never_reaches_tool_result(tmp_pa
     result = run_harness("task", str(tmp_path), ["REQ-A"], executor=executor)
     assert result["results"]["REQ-A"] == "FAIL"
     assert canary not in str(result)
+
+
+def test_sanitize_rejects_untrusted_obligation_identifier():
+    canary = "CONTRACT_ASSERTION_CANARY_DO_NOT_LEAK_7f4d"
+    try:
+        sanitize({"tests": []}, [canary])
+    except HarnessError as exc:
+        assert canary not in str(exc)
+    else:
+        raise AssertionError("untrusted obligation identifier was accepted")

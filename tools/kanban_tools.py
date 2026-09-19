@@ -983,7 +983,8 @@ def _handle_create(args: dict, **kw) -> str:
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
-            created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
+            created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id,
+            obligations=args.get("obligations"), feedback_schema=args.get("feedback_schema"))
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
@@ -1100,6 +1101,9 @@ def _handle_link(args: dict, **kw) -> str:
 
 # --- Contract-test harness ---
 
+_DEVELOPMENT_ROLES = frozenset({"dev", "developer", "junior-dev", "senior-dev"})
+
+
 def _check_run_contract_tests() -> bool:
     """Expose the tool only to a scoped single-blind development worker."""
     if not _visible(to_env_worker=True):
@@ -1110,8 +1114,9 @@ def _check_run_contract_tests() -> bool:
     try:
         with _board(None, quiet_close=True) as (kb, conn):
             task = kb.get_task(conn, tid)
+            role = str(getattr(task, "role", "") or "").strip().casefold()
             return bool(task and getattr(task, "card_class", None) == "single_blind"
-                        and getattr(task, "role", "dev") == "dev")
+                        and role in _DEVELOPMENT_ROLES)
     except Exception:
         return False
 
