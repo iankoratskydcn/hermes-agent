@@ -78,9 +78,13 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
 
   const suffix = pluginPathSuffix('pluginRest', path)
   const query = new URLSearchParams()
+
   for (const [key, value] of Object.entries(opts.query ?? {})) {
-    if (value !== null && value !== undefined) query.set(key, String(value))
+    if (value !== null && value !== undefined) {
+      query.set(key, String(value))
+    }
   }
+
   const querySuffix = query.toString() ? `${suffix.includes('?') ? '&' : '?'}${query}` : ''
 
   return hermesApi<T>({

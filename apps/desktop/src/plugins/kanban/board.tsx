@@ -83,7 +83,14 @@ import { BoardSwitcher } from './board-switcher'
 import { TaskDrawer } from './drawer'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
-import { type BoardMeta, type BoardsResponse, columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
+import {
+  type BoardMeta,
+  type BoardsResponse,
+  columnMeta,
+  type KanbanBoard,
+  type KanbanTask,
+  type TaskEstimate
+} from './types'
 import {
   $newTaskLane,
   ago,
@@ -964,9 +971,7 @@ export function BoardHeaderToggles({ board }: { board: BoardMeta }) {
       onError: err => host.notify({ kind: 'error', message: errText(err) }),
       onSuccess: result => {
         qc.setQueryData<BoardsResponse>(BOARDS_KEY, prev =>
-          prev
-            ? { ...prev, boards: prev.boards.map(b => (b.slug === board.slug ? result.board : b)) }
-            : prev
+          prev ? { ...prev, boards: prev.boards.map(b => (b.slug === board.slug ? result.board : b)) } : prev
         )
         void qc.invalidateQueries({ queryKey: BOARDS_KEY })
       }
@@ -976,15 +981,7 @@ export function BoardHeaderToggles({ board }: { board: BoardMeta }) {
   const decomposeMut = useToggle('auto_decompose_enabled')
   const reviewMut = useToggle('review_dispatch_enabled')
 
-  const Row = ({
-    checked,
-    label,
-    mut
-  }: {
-    checked: boolean
-    label: string
-    mut: ReturnType<typeof useToggle>
-  }) => (
+  const Row = ({ checked, label, mut }: { checked: boolean; label: string; mut: ReturnType<typeof useToggle> }) => (
     <label
       className="flex cursor-pointer items-center gap-1.5 text-[0.75rem] text-(--ui-text-secondary)"
       title={k.headerEnforcementPendingHint}
