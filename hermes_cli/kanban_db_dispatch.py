@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli.kanban_provider_failover import (
+    normalize_failover_routes,
     route_evidence_from_config,
     route_key,
     select_failover_route,
@@ -2402,13 +2403,46 @@ def _apply_provider_failover(conn: sqlite3.Connection, task_id: str) -> Optional
         status = evidence.get(failed_key)
         if status is not None:
             status["quota_until"] = max(float(status.get("quota_until") or 0), float(run["ended_at"] or 0) + cooldown)
-    selected = select_failover_route(raw_routes, original, evidence, now=now)
+    def _runtime_evidence(route: Mapping[str, str]) -> Optional[dict[str, Any]]:
+        """Return live, non-secret route evidence; unknown means reject."""
+        profile_exists = _profile_exists_fn()
+        if profile_exists is None or not profile_exists(route["assignee"]):
+            return None
+        try:
+            from hermes_cli.models import list_available_providers, provider_model_ids
+            providers = {str(p.get("id") or "").casefold(): p for p in list_available_providers()}
+            provider = providers.get(route["provider"].casefold())
+            if not isinstance(provider, Mapping) or provider.get("authenticated") is not True:
+                return None
+            models = {str(model).casefold() for model in provider_model_ids(route["provider"])}
+            if route["model"].casefold() not in models:
+                return None
+        except Exception:
+            return None
+        return {
+            "profile_dispatchable": True,
+            "provider_available": True,
+            "model_available": True,
+        }
+
+    route_status = {key: dict(status) for key, status in evidence.items()}
+    for route in normalize_failover_routes(raw_routes):
+        key = route_key(route)
+        runtime = _runtime_evidence(route)
+        if runtime is not None:
+            route_status.setdefault(key, {}).update(runtime)
+    selected = select_failover_route(raw_routes, original, route_status, now=now)
     if selected is None:
         return None
-    evidence_summary = {"authenticated": True, "available": True}
+    evidence_summary = {
+        "operator_attested": True,
+        "profile_dispatchable": True,
+        "provider_available": True,
+        "model_available": True,
+    }
     with _kb.write_txn(conn):
         row = conn.execute(
-            "SELECT assignee, model_override, provider_override, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, assignee, model_override, provider_override, current_run_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if row is None:
@@ -2416,10 +2450,23 @@ def _apply_provider_failover(conn: sqlite3.Connection, task_id: str) -> Optional
         original_route = {
             "assignee": row["assignee"], "provider": row["provider_override"], "model": row["model_override"],
         }
-        conn.execute(
-            "UPDATE tasks SET assignee = ?, model_override = ?, provider_override = ? WHERE id = ?",
-            (selected["assignee"], selected["model"], selected["provider"], task_id),
+        params = (
+            selected["assignee"], selected["model"], selected["provider"], task_id,
+            row["status"], row["current_run_id"], row["current_run_id"],
+            row["assignee"], row["assignee"], row["provider_override"], row["provider_override"],
+            row["model_override"], row["model_override"],
         )
+        changed = conn.execute(
+            "UPDATE tasks SET assignee = ?, model_override = ?, provider_override = ? "
+            "WHERE id = ? AND status = ? "
+            "AND (current_run_id = ? OR (current_run_id IS NULL AND ? IS NULL)) "
+            "AND (assignee = ? OR (assignee IS NULL AND ? IS NULL)) "
+            "AND (provider_override = ? OR (provider_override IS NULL AND ? IS NULL)) "
+            "AND (model_override = ? OR (model_override IS NULL AND ? IS NULL))",
+            params,
+        )
+        if changed.rowcount != 1:
+            return None
         payload = {
             "reason": "provider_quota",
             "original_route": original_route,

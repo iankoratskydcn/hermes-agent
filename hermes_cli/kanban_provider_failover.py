@@ -55,7 +55,16 @@ def select_failover_route(
         status = evidence.get(key)
         if not isinstance(status, Mapping):
             continue
+        # ``authenticated``/``available`` are only operator attestations.  The
+        # dispatcher must also prove the route is actually dispatchable and its
+        # provider/model are usable; absent runtime evidence is unknown.
+        if status.get("operator_attested") is not True:
+            continue
         if status.get("authenticated") is not True or status.get("available") is not True:
+            continue
+        if any(status.get(k) is not True for k in (
+            "profile_dispatchable", "provider_available", "model_available",
+        )):
             continue
         try:
             quota_until = float(status.get("quota_until") or 0)
@@ -86,6 +95,7 @@ def route_evidence_from_config(raw: Any) -> dict[RouteKey, dict[str, Any]]:
         if not all(route.values()):
             continue
         result[route_key(route)] = {
+            "operator_attested": item.get("operator_attested") is True,
             "authenticated": item.get("authenticated") is True,
             "available": item.get("available") is True,
             "quota_until": item.get("quota_until", 0),

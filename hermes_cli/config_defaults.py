@@ -1848,8 +1848,10 @@ DEFAULT_CONFIG = {
         # default-assigned cards.
         "dispatch_profiles": None,
         # Ordered, explicit quota-failover routes. Each route must include
-        # assignee/provider/model plus authenticated: true and available: true;
-        # missing evidence fails closed. Review cards require the separate opt-in.
+        # assignee/provider/model plus operator_attested: true and the
+        # authenticated/available attestation. The dispatcher still verifies
+        # profile/provider/model dispatchability at runtime; missing evidence
+        # fails closed. Review cards require the separate opt-in.
         "provider_failover_routes": [],
         "provider_failover_allow_review": False,
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
