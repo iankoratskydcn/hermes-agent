@@ -28,6 +28,11 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.kanban_provider_failover import (
+    route_evidence_from_config,
+    route_key,
+    select_failover_route,
+)
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -171,6 +176,8 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    provider_failovers: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, selected_assignee)`` route changes applied after quota exits."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -1591,6 +1598,8 @@ def check_respawn_guard(
             if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
                 return "infrastructure_cooldown"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
+        if _kb._json_dict(latest_run["metadata"]).get("failover_applied"):
+            return None
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, skipping blocker_auth so
             # the stamped rate-limit text doesn't re-trap the task.
@@ -2350,6 +2359,87 @@ def _dispatch_lane_task(
         return False
 
 
+def _apply_provider_failover(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Atomically apply the configured next route after a quota exit.
+
+    This boundary runs after the worker has ended; it never changes an active
+    request. Route availability is explicit config evidence, so missing or
+    unknown authentication fails closed.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = (load_config() or {}).get("kanban") or {}
+    except Exception:
+        return None
+    if not isinstance(cfg, Mapping):
+        return None
+    task = _kb.get_task(conn, task_id)
+    if task is None or (task.status == "review" and not cfg.get("provider_failover_allow_review", False)):
+        return None
+    raw_routes = cfg.get("provider_failover_routes")
+    evidence = route_evidence_from_config(raw_routes)
+    if not evidence:
+        return None
+    original = route_key({
+        "assignee": task.assignee,
+        "provider": task.provider_override,
+        "model": task.model_override,
+    })
+    now = time.time()
+    latest_runs = conn.execute(
+        "SELECT outcome, ended_at, metadata FROM task_runs WHERE task_id = ? "
+        "AND ended_at IS NOT NULL ORDER BY ended_at DESC", (task_id,),
+    ).fetchall()
+    cooldown = _kb._resolve_rate_limit_cooldown_seconds()
+    for run in latest_runs:
+        if run["outcome"] != "rate_limited":
+            continue
+        meta = _kb._json_dict(run["metadata"])
+        failed = meta.get("failed_route") or meta.get("original_route") or meta.get("route")
+        if not isinstance(failed, Mapping):
+            continue
+        failed_key = route_key(failed)
+        status = evidence.get(failed_key)
+        if status is not None:
+            status["quota_until"] = max(float(status.get("quota_until") or 0), float(run["ended_at"] or 0) + cooldown)
+    selected = select_failover_route(raw_routes, original, evidence, now=now)
+    if selected is None:
+        return None
+    evidence_summary = {"authenticated": True, "available": True}
+    with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT assignee, model_override, provider_override, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        original_route = {
+            "assignee": row["assignee"], "provider": row["provider_override"], "model": row["model_override"],
+        }
+        conn.execute(
+            "UPDATE tasks SET assignee = ?, model_override = ?, provider_override = ? WHERE id = ?",
+            (selected["assignee"], selected["model"], selected["provider"], task_id),
+        )
+        payload = {
+            "reason": "provider_quota",
+            "original_route": original_route,
+            "failed_route": original_route,
+            "selected_route": dict(selected),
+            "evidence": evidence_summary,
+            "failover_applied": True,
+        }
+        run_row = conn.execute(
+            "SELECT id, metadata FROM task_runs WHERE task_id = ? AND outcome = 'rate_limited' "
+            "AND ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        _kb._append_event(conn, task_id, "provider_failover", payload, run_id=run_row["id"] if run_row else None)
+        if run_row is not None:
+            meta = _kb._json_dict(run_row["metadata"])
+            meta.update(payload)
+            conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?", (json.dumps(meta, sort_keys=True), run_row["id"]))
+    return selected["assignee"]
+
+
 def _apply_default_assignee(
     conn: sqlite3.Connection, task_id: str, assignee: str, *, dry_run: bool,
 ) -> bool:
@@ -2389,6 +2479,7 @@ def _run_reclaim_phase(
     failure_limit: int,
     reconcile_orphans: bool,
     board: Optional[str] = None,
+    dry_run: bool = False,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
@@ -2402,6 +2493,12 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    for task_id in result.rate_limited:
+        if dry_run:
+            continue
+        selected_assignee = _apply_provider_failover(conn, task_id)
+        if selected_assignee:
+            result.provider_failovers.append((task_id, selected_assignee))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
@@ -2587,6 +2684,7 @@ def _dispatch_once_locked(
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
+        dry_run=dry_run,
     )
     block_reason = _check_batch_approval_gate(board)
     if block_reason is not None:
