@@ -2404,12 +2404,27 @@ def _apply_provider_failover(conn: sqlite3.Connection, task_id: str) -> Optional
         if status is not None:
             status["quota_until"] = max(float(status.get("quota_until") or 0), float(run["ended_at"] or 0) + cooldown)
     def _runtime_evidence(route: Mapping[str, str]) -> Optional[dict[str, Any]]:
-        """Return live, non-secret route evidence; unknown means reject."""
+        """Return live route evidence from the assignee's isolated profile."""
         profile_exists = _profile_exists_fn()
         if profile_exists is None or not profile_exists(route["assignee"]):
             return None
+        home_token = secret_token = None
+        reset_home = reset_secret = None
         try:
             from hermes_cli.models import list_available_providers, provider_model_ids
+            from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+            from agent.secret_scope import (
+                build_profile_secret_scope, is_multiplex_active,
+                reset_secret_scope, set_secret_scope,
+            )
+            from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+            reset_home = reset_hermes_home_override
+            reset_secret = reset_secret_scope
+            profile_home = resolve_profile_env(normalize_profile_name(route["assignee"]))
+            home_token = set_hermes_home_override(profile_home)
+            if is_multiplex_active():
+                secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
             providers = {str(p.get("id") or "").casefold(): p for p in list_available_providers()}
             provider = providers.get(route["provider"].casefold())
             if not isinstance(provider, Mapping) or provider.get("authenticated") is not True:
@@ -2419,6 +2434,11 @@ def _apply_provider_failover(conn: sqlite3.Connection, task_id: str) -> Optional
                 return None
         except Exception:
             return None
+        finally:
+            if secret_token is not None and reset_secret is not None:
+                reset_secret(secret_token)
+            if home_token is not None and reset_home is not None:
+                reset_home(home_token)
         return {
             "profile_dispatchable": True,
             "provider_available": True,
