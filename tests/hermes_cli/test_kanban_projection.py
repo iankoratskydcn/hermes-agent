@@ -77,3 +77,43 @@ def test_symlink_is_rejected(tmp_path):
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
     with pytest.raises(ScopeError, match="symlink"):
         resolve_scope(SimpleNamespace(scope_paths=["src/link"]), RoleCeiling(frozenset({"src/**"})), repo=repo, base_sha=sha)
+
+
+# Malformed scope_paths and ceiling in projection: incomplete, hostile, or invalid request.
+def test_scope_paths_with_traversal_is_rejected_early(tmp_path):
+    """A scope_paths entry with .. traversal is rejected before ceiling clipping."""
+    repo, sha = git_repo(tmp_path)
+    with pytest.raises(ScopeError, match="traversal"):
+        resolve_scope(
+            SimpleNamespace(scope_paths=["src/../../../etc/passwd"]),
+            RoleCeiling(frozenset({"**"})),
+            repo=repo,
+            base_sha=sha
+        )
+
+
+def test_scope_paths_with_absolute_path_is_rejected(tmp_path):
+    """A scope_paths entry that is absolute is rejected."""
+    repo, sha = git_repo(tmp_path)
+    with pytest.raises(ScopeError, match="invalid scope path"):
+        resolve_scope(
+            SimpleNamespace(scope_paths=["/etc/passwd"]),
+            RoleCeiling(frozenset({"**"})),
+            repo=repo,
+            base_sha=sha
+        )
+
+
+def test_projection_with_no_readable_files_is_rejected(tmp_path):
+    """A scope that matches no files in the repo results in empty projection, which is rejected."""
+    repo, sha = git_repo(tmp_path)
+    # Request a path that doesn't exist in the repo
+    scope = resolve_scope(
+        SimpleNamespace(scope_paths=["nonexistent/**"]),
+        RoleCeiling(frozenset({"src/**"})),
+        repo=repo,
+        base_sha=sha
+    )
+    assert not scope.paths
+    with pytest.raises(ScopeError, match="empty scope"):
+        build_projection(sha, scope, tmp_path / "projection", repo=repo)
