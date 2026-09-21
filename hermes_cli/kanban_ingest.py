@@ -83,7 +83,7 @@ def _validate(task: Any) -> tuple[bool, str]:
     if not isinstance(manifest.get("read", []), list) or not isinstance(manifest.get("write", []), list):
         return False, "scope_manifest must contain list-valued read and write entries"
     for key in ("read", "write"):
-        for path in manifest[key]:
+        for path in manifest.get(key, []):
             if not isinstance(path, str) or not path.strip() or Path(path).is_absolute() or ".." in Path(path).parts:
                 return False, f"scope_manifest.{key} contains an unsafe path"
     return True, "ok"
