@@ -724,6 +724,9 @@ _SKILL_COUNT_TTL_SECONDS = 600.0
 _SKILL_COUNT_RECHECK_SECONDS = 60.0
 _SKILL_COUNT_NEXT_CHECK: dict[str, float] = {}
 _SKILL_COUNT_LOCK = threading.Lock()
+# One scan lock per skills dir so concurrent cold scans of the SAME profile share one walk
+# while different profiles' scans still run in parallel.
+_SKILL_COUNT_SCAN_LOCKS: dict[str, threading.Lock] = {}
 
 
 def _skills_dir_signature(skills_dir: Path) -> float:
@@ -764,13 +767,21 @@ def _count_skills(profile_dir: Path) -> int:
         return 0
     key = str(skills_dir)
     signature = _skills_dir_signature(skills_dir)
-    now = time.time()
     cached = _SKILL_COUNT_CACHE.get(key)
-    if cached is not None and cached[0] == signature and (now - cached[1]) < _SKILL_COUNT_TTL_SECONDS:
+    if cached is not None and cached[0] == signature and (time.time() - cached[1]) < _SKILL_COUNT_TTL_SECONDS:
         return cached[2]
-    count = _walk_skill_count(skills_dir)
-    _SKILL_COUNT_CACHE[key] = (signature, now, count)
-    return count
+    with _SKILL_COUNT_LOCK:
+        scan_lock = _SKILL_COUNT_SCAN_LOCKS.setdefault(key, threading.Lock())
+    with scan_lock:
+        # Re-check under the lock: a concurrent caller may have just finished this walk.
+        signature = _skills_dir_signature(skills_dir)
+        cached = _SKILL_COUNT_CACHE.get(key)
+        if cached is not None and cached[0] == signature and (time.time() - cached[1]) < _SKILL_COUNT_TTL_SECONDS:
+            return cached[2]
+        count = _walk_skill_count(skills_dir)
+        # Stamp AFTER the walk: a scan longer than the TTL must not publish an already-expired entry.
+        _SKILL_COUNT_CACHE[key] = (signature, time.time(), count)
+        return count
 
 
 def _cached_skill_count(profile_dir: Path) -> int:
@@ -1024,23 +1035,43 @@ def _standalone_truthy(value: object) -> bool:
     return bool(value)
 
 
-def profiles_to_serve(multiplex: bool, *, include_standalone: bool = False) -> List[Tuple[str, Path]]:
+def parked_marker_path(home: Path) -> Path:
+    return Path(home) / "gateway.parked"
+
+
+def profile_is_parked(home: Path) -> bool:
+    """Marker contents are deliberately irrelevant, including for provisioning."""
+    return parked_marker_path(home).exists()
+
+
+_parked_default_warned: set[Path] = set()
+
+
+def profiles_to_serve(multiplex: bool, *, include_standalone: bool = False,
+                      include_parked: bool = False) -> List[Tuple[str, Path]]:
     """``(profile_name, hermes_home)`` pairs a gateway should serve — the single chokepoint
     for "which profiles does the inbound gateway handle".
 
     ``multiplex=False``: exactly one entry for the *active* profile (byte-for-byte the
     historical single-profile behavior; name is ``"default"`` or the named profile's id).
     ``multiplex=True``: default plus every live named profile under ``profiles/`` (tombstoned
-    profiles skipped). Pure directory read: never creates a profile dir (#94590).
+    and parked profiles skipped). Pure directory read: never creates a profile dir (#94590).
 
     Named profiles that authored ``gateway.standalone: true`` are skipped because they opted
-    out of the host multiplexer; callers enumerating INSTALLED profiles pass ``include_standalone=True``."""
+    out of the host multiplexer; a ``gateway.parked`` marker (``hermes -p X gateway stop``) skips
+    a profile the host would otherwise serve. Callers enumerating INSTALLED profiles pass
+    ``include_standalone=True, include_parked=True``; serving/ticking callers pass neither."""
     active = get_active_profile_name() or "default"
+    default = _get_default_hermes_home()
+    if profile_is_parked(default) and default not in _parked_default_warned:
+        logger.warning("Ignoring gateway.parked for the default profile; stop the host gateway instead")
+        _parked_default_warned.add(default)
     if not multiplex:
         return [(active, get_profile_dir(active))]
-    serve: List[Tuple[str, Path]] = [("default", _get_default_hermes_home())]
+    serve: List[Tuple[str, Path]] = [("default", default)]
     serve.extend((entry.name, entry) for entry in _iter_named_profile_dirs()
-                 if include_standalone or not profile_is_standalone(entry))
+                 if (include_standalone or not profile_is_standalone(entry))
+                 and (include_parked or not profile_is_parked(entry)))
     return serve
 
 
