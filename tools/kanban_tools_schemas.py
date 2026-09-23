@@ -496,12 +496,17 @@ KANBAN_CREATE_SCHEMA = _schema(
         )),
         "provider": _prop("string", (
                 "Provider the 'model' belongs to (e.g. 'openrouter', "
-                "'anthropic', 'nous'). Set this whenever the model "
-                "is not from the assignee profile's configured "
+                "'anthropic', 'nous'). Set this whenever the "
+                "model is not from the assignee profile's configured "
                 "provider — a model name alone is resolved against "
                 "the profile's provider and will fail if it belongs "
                 "to a different one. Requires 'model'."
         )),
+        "obligations": {
+            "type": "array", "items": {"type": "string"},
+            "description": "Frozen REQ-* obligation identifiers evaluated by run_contract_tests.",
+        },
+        "feedback_schema": _prop("string", "Contract-test feedback schema; matrix is the only supported dev-facing form."),
     },
     ["title", "assignee"],
 )
@@ -519,6 +524,14 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
     },
     ["task_id"],
 )
+
+KANBAN_RUN_CONTRACT_TESTS_SCHEMA = _schema(
+    "run_contract_tests",
+    "Run the task's frozen contract obligations in the dispatcher-owned sandbox and return only PASS/FAIL obligation results. Available only to single-blind development workers.",
+    {},
+    [],
+)
+
 
 KANBAN_LINK_SCHEMA = _schema(
     "kanban_link",
