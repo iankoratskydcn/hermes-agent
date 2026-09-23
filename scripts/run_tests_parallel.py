@@ -962,6 +962,19 @@ def _pytest_flag_error(tokens: List[str]) -> Optional[str]:
     return f"unrecognized arguments: {' '.join(unknown)}" if unknown else None
 
 
+def _default_jobs() -> int:
+    """Default -j/--jobs value: $HERMES_TEST_WORKERS if set, else cpu_count.
+
+    No oversubscription factor: each invocation of this runner already
+    spawns one pytest subprocess per worker, and the caller (e.g. the
+    kanban dispatcher) may run several invocations concurrently. A
+    per-invocation multiplier compounds across concurrent invocations
+    and has caused system-wide overload; HERMES_TEST_WORKERS remains a
+    full override for anyone who wants oversubscription deliberately.
+    """
+    return int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4))
+
+
 def main() -> int:
     _make_stdio_glyph_safe()
     parser = argparse.ArgumentParser(
@@ -972,8 +985,8 @@ def main() -> int:
         "-j",
         "--jobs",
         type=int,
-        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4) * 2),
-        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count*2)",
+        default=_default_jobs(),
+        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count)",
     )
     parser.add_argument(
         "--paths",
