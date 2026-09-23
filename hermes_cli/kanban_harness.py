@@ -89,7 +89,11 @@ def _default_executor(snapshot_path: str, report_path: str, *, image: str, timeo
         host_cwd=snapshot_path, auto_mount_cwd=True, persist_across_processes=False,
     )
     try:
+        # no-tmp: ok — path inside the isolated DockerEnvironment sandbox container,
+        # not the host filesystem; hermes_constants.get_scratch_dir() resolves a host
+        # path and does not apply to the container's own ephemeral /tmp.
         result = env.execute(
+            # no-tmp: ok — in-container path, see comment above.
             "pytest --json-report --json-report-file=/tmp/contract-report.json",
             cwd="/workspace",
         )
@@ -97,6 +101,7 @@ def _default_executor(snapshot_path: str, report_path: str, *, image: str, timeo
             raise HarnessError("contract-test execution failed")
         # Read the report through the sandbox's existing execution channel.  Do not
         # expose result['output']; it may contain assertion messages.
+        # no-tmp: ok — same in-container path as above.
         report_result = env.execute("cat /tmp/contract-report.json", cwd="/workspace")
         if report_result.get("returncode", 1) != 0:
             raise HarnessError("contract-test report unavailable")
