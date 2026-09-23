@@ -80,13 +80,23 @@ rather than "this profile's gateway":
   multiplexer*. They never sweep every gateway process on the box; a profile
   that still runs its own gateway is reported, never killed, with the
   `hermes gateway migrate --multiplex` one-liner.
-- `hermes gateway run --replace` takes the host role over, whichever profile
-  launched the running process; `hermes gateway run --force` starts a separate
-  gateway without asking the host process at all (the escape hatch when it is
-  wedged or answering wrongly).
+- `hermes gateway run --replace` takes over the process **serving this
+  profile**, whichever profile launched it. When the host owner is another
+  profile's standalone gateway (an unmigrated per-profile fleet) it never serves
+  this profile, so `--replace` starts beside it exactly as a plain `run` does,
+  instead of refusing and respawn-storming under the supervisor. An older Hermes
+  wrote a systemd drop-in (`hermes-gateway.service.d/20-replace.conf`) that
+  forced `--replace` onto the unit; `hermes update` / `hermes gateway restart`
+  now remove that file. `hermes gateway run --force` starts a separate gateway
+  without asking the host process at all (the escape hatch when it is wedged or
+  answering wrongly).
 - Under a service supervisor the attach exits 75, not 0 — systemd, s6 and
   launchd all restart a 75 after a short delay, so the unit keeps retrying and
   takes over by itself the moment the host process goes away.
+- Two units started at once can both see no host process yet; the host lock
+  decides which one runs, and the loser exits 75 and attaches on the retry.
+  `--replace` does not skip that check (every generated unit carries it), only
+  `--force` does.
 
 Multiplexing is **on by default** (`gateway.multiplex_profiles` defaults to
 `true`), with one safety rule: an *unset* flag is a request the default gateway
@@ -611,6 +621,7 @@ profile and never shares with the default or any sibling:
 | Dashboard actions (`hermes -p <name> …` spawned by the Desktop/dashboard) | A scrubbed child env pinned to that profile's `HERMES_HOME` | The child loads its own `.env`; the dashboard profile's tokens and ports are not inherited |
 | Every child that acts for a served profile (slash worker, Bot Chat delivery, A2A forward, `key_cmd` helper, browser driver) | That profile's own `.env` + secret sources over a credential-scrubbed base — with or without `gateway.multiplex_profiles` (the Desktop/dashboard `?profile=` route counts) | Absent from the child — a key that reached the launch process only through systemd / Compose / the shell is never inherited by another profile's child |
 | Authorization gates in a child spawned for another profile (`*_ALLOWED_USERS` / `*_ALLOWED_CHANNELS` / `*_IGNORED_CHANNELS` / `*_ALLOW_ALL_USERS` / `*_ALLOW_BOTS`, `GATEWAY_ALLOW*`) — dashboard `hermes -p <name>` actions, kanban workers, Bot Chat delivery, the post-update per-profile `gateway restart` | The child's own `.env` / `config.yaml`, loaded by the child itself | Closed (the adapter's documented default) — a gate exported into the spawning process by a unit file or the shell is dropped before the child starts, so profile B never enforces profile A's channel or user list; a same-profile child keeps it |
+| Routed-profile detection in an embedding host that mirrors the served profile into the live `HERMES_HOME` env var for legacy readers (Hermes WebUI) | The launch home the host pinned with `hermes_constants.pin_process_hermes_home()`; MCP connection keys, the launch-env strip for a served profile's children, the bridged allow-all seed and the `terminal.*` env-bridge guard all compare against it | Without a pin the live env var is the launch home, exactly as before — a host that never mutates `HERMES_HOME` needs nothing |
 | The launch (default) profile's own credentials in a `hermes serve` / dashboard process that also serves another profile | Its `.env` + secret sources over the process env **frozen the moment the first other profile is served**; not re-read afterwards | A credential rotated only in the process env (`systemctl set-environment`, a refreshed `op run` wrapper that did not re-exec) is not picked up until the process restarts — put rotating keys in `.env` or a secret source, or restart after rotating |
 | Cron `.env` tuning (`HERMES_CRON_TIMEOUT`, `HERMES_MODEL` fallback, `HERMES_CRON_MAX_PARALLEL`, prefill file), worker / Bot Chat child env | The profile's own `.env`; children never inherit the default profile's `.env` settings or bridged `TERMINAL_*` policy | Cron defaults / model refusal, exactly as a standalone `hermes -p <name> gateway run` |
 | Kanban workers and notifications for a profile's tasks | The assignee's `.env` + `config.yaml` (toolset pin, terminal backend, media policy, display language) | — |
