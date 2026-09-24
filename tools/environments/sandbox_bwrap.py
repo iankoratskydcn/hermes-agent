@@ -170,6 +170,7 @@ def build_bwrap_argv(*, read_paths: list[str], write_paths: list[str],
             "--clearenv", "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
             "--setenv", "HOME", "/work", "--setenv", "TERM",
             os.environ.get("TERM", "dumb"), "--proc", "/proc", "--dev", "/dev",
+            # no-tmp: ok — bwrap's own in-namespace /tmp mount, not host scratch space
             "--tmpfs", "/tmp"]
     writable = set(_existing(write_paths))
     for path in _existing(read_paths + toolchain_ro_dirs):
