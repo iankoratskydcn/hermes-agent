@@ -2283,8 +2283,31 @@ def _dispatch_lane_task(
     # skip _call_spawn_fn entirely (never Popen a full worker for this task).
     if _sidecar_route.sidecar_routing_enabled():
         task_for_sidecar = _kb.get_task(conn, task_id)
+        sidecar_result = None
         if task_for_sidecar is not None:
-            sidecar_result = _sidecar_route.try_sidecar_route(task_for_sidecar)
+            # Same profile-scoping requirement as every other dispatch-side secret
+            # read (see _worker_profile_scope docstring): the dispatcher runs
+            # detached from any turn, so try_sidecar_route()'s get_secret() call
+            # for SIDECAR_SERVICE_API_KEY needs an explicit bound scope on a
+            # multiplexed gateway or it raises UnscopedSecretError and crashes
+            # the whole tick for every task behind this one, not just this task.
+            from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+            try:
+                profile_home = resolve_profile_env(normalize_profile_name(assignee))
+            except FileNotFoundError:
+                profile_home = None
+            try:
+                with (_worker_profile_scope(profile_home, bind_home=False) if profile_home
+                      else contextlib.nullcontext()):
+                    sidecar_result = _sidecar_route.try_sidecar_route(task_for_sidecar)
+            except Exception:
+                # Fail closed exactly like an ineligible/failed route: fall
+                # through to a normal spawn rather than losing the whole tick.
+                _kb._log.exception(
+                    "kanban dispatcher: sidecar route raised for task %s, falling "
+                    "through to normal spawn", task_id,
+                )
+                sidecar_result = None
             if sidecar_result is not None:
                 if not dry_run:
                     with _kb.write_txn(conn):
