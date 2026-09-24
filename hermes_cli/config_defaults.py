@@ -1052,6 +1052,10 @@ DEFAULT_CONFIG = {
         # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" |
         # "gemini" | "deepinfra" | "neutts" (local) | "kittentts" (local) | "piper" (local)
         "provider": "edge",
+        # Seconds a local engine (Piper, KittenTTS) stays loaded after the last speech toggle
+        # turns off, so a quick re-activation (wake word, voice-chat restart) skips the reload.
+        # 0 unloads immediately.
+        "keep_warm_seconds": 60,
         "streaming": {
             # Shortest first sentence (chars) spoken on its own by streaming TTS; shorter openers
             # ride with the next sentence. 20 suits English; CJK voice setups use ~6.
@@ -1684,6 +1688,9 @@ DEFAULT_CONFIG = {
     # Plugin system. `enabled`/`disabled` lists are written by `hermes plugins enable|disable` and
     # deliberately omitted here so an empty default never clobbers a user allow-list.
     "plugins": {
+        # Deadline (seconds) for one plugin Git clone, fetch or checkout. Slow repositories may
+        # need more time; each network operation is capped at one hour.
+        "clone_timeout_seconds": 300,
         # Wall-clock cap (seconds) for one in-process Python plugin hook callback; shell hooks keep
         # their own per-entry `timeout`. 0 = no cap (sync call on agent thread). Max 600.
         "hook_callback_timeout": 30,
@@ -1938,6 +1945,19 @@ DEFAULT_CONFIG = {
         # (hermes_cli/kanban_sidecar_route.py). False (default) = always spawn normally;
         # an operator must explicitly enable this, same as gate_precheck_enabled above.
         "sidecar_routing_enabled": False,
+        # Rolling-window provider-quota guard (hermes_cli/kanban_provider_budget.py):
+        # maps profiles that share ONE provider account's credentials to a shared
+        # rate-limit budget, so a fan-out across those profiles pauses dispatch to the
+        # WHOLE account after max_rate_limit_hits 429s within window_seconds, instead of
+        # each task independently bouncing off the same quota wall. Empty (default) =
+        # off; an operator must explicitly map an account's profiles to opt in, same
+        # rationale as gate_precheck_enabled/sidecar_routing_enabled above. Example:
+        #   provider_budgets:
+        #     shared-openai-key:
+        #       profiles: ["alice", "bob"]
+        #       max_rate_limit_hits: 3   # default 3
+        #       window_seconds: 3600     # default 3600 (1 hour)
+        "provider_budgets": {},
     },
     # sidecar_service: HTTP backend for kanban_sidecar_route.py's auto-routing (a
     # locally- or remotely-run sidecar_service instance; see mcp_servers.sidecar_service
@@ -2505,9 +2525,11 @@ DEFAULT_CONFIG = {
         # host. Off by default so installing TigerVNC for other reasons never yields a screen nobody asked
         # for; Hermes Desktop's Screen pane offers Start and this toggle.
         "auto_start": False,
-        # Refuse to start the screen while the host (or its container cgroup) has less than this free.
-        # Xvnc + Xfce idle at ~220 MB and a takeover's browser adds 0.5-1 GB; on a small instance the
-        # loser is Chromium mid-login or the gateway itself. 0 disables the check.
+        # Refuse to start below this much free memory (MB), measured on the host or its container cgroup,
+        # whichever is tighter. Xvnc + Xfce idle at ~220 MB and a takeover's browser adds 0.5-1 GB, so a
+        # screen with one page runs past 1 GB; the kernel OOM killer picks its victim by score, so on a
+        # small instance the loser is the dashboard or the gateway rather than the desktop. 0 disables the
+        # check.
         "min_free_memory_mb": 1536,
         # Stop a screen nobody has used (no computer_use action, browser spawn, viewer or takeover) for this
         # long; it restarts on the next use. Idle Xvnc + Xfce hold ~220 MB, an abandoned browser far more.
