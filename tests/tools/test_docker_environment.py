@@ -57,10 +57,47 @@ def _make_dummy_env(**kwargs):
         shared_container_key=kwargs.get("shared_container_key", ""),
         shm_size=kwargs.get("shm_size", docker_env._DEFAULT_SHM_SIZE),
         snap_compat=kwargs.get("snap_compat", False),
+        scope=kwargs.get("scope"),
+        require_digest_pin=kwargs.get("require_digest_pin", False),
     )
 
 
-def test_ensure_docker_available_raises_when_not_found(monkeypatch):
+def test_namespace_escape_extra_arg_rejected_before_docker(monkeypatch):
+    monkeypatch.setattr(docker_env, "_ensure_docker_available", lambda: pytest.fail("must fail closed first"))
+    with pytest.raises(RuntimeError, match="namespace escape"):
+        _make_dummy_env(extra_args=["--pid=host"])
+
+
+def test_scope_bind_args_rejects_path_escape(tmp_path):
+    with pytest.raises(ValueError, match="escapes project root"):
+        docker_env.scope_bind_args({"read": ["../outside"], "write": []}, str(tmp_path))
+
+
+def test_scope_mounts_are_explicit_and_rootfs_is_read_only(monkeypatch, tmp_path):
+    project = tmp_path / "project"
+    (project / "spec").mkdir(parents=True)
+    (project / "src").mkdir()
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    env = _make_dummy_env(
+        cwd="/workspace", host_cwd=str(project), scope={"read": ["spec"], "write": ["src"]})
+    assert any(arg.endswith(":/workspace/spec:ro") for arg in env._all_run_args)
+    assert any(arg.endswith(":/workspace/src:rw") for arg in env._all_run_args)
+    assert "--read-only" in env._all_run_args
+    assert calls
+
+
+def test_digest_mismatch_blocks_launch(monkeypatch):
+    digest = "a" * 64
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_ensure_docker_available", lambda: None)
+    monkeypatch.setattr(docker_env, "_docker_query", lambda *args, **kwargs: subprocess.CompletedProcess(
+        [], 0, stdout=f"repo@sha256:{'b' * 64}\\n", stderr=""))
+    with pytest.raises(RuntimeError, match="digest mismatch"):
+        _make_dummy_env(image=f"repo@sha256:{digest}", require_digest_pin=True)
+
+
+def test_ensure_docker_available_logs_and_raises_when_not_found(monkeypatch, caplog):
     """When docker cannot be found, raise a clear error before container setup."""
 
     monkeypatch.setattr(docker_env, "find_docker", lambda: None)
@@ -694,6 +731,21 @@ def test_shared_container_key_replaces_profile_identity(monkeypatch):
     assert a._labels["hermes-profile"] != "research"
     assert a._labels["hermes-profile"].startswith("team_workspace-")
 
+
+def test_namespace_escape_privileged_assignment_rejected():
+    assert docker_env._extra_args_namespace_violation(["--privileged=true"]) == "--privileged=true"
+
+
+def test_digest_same_hash_different_repository_rejected(monkeypatch):
+    digest = "a" * 64
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        docker_env, "_docker_query",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            [], 0, stdout=f"other.registry/name@sha256:{digest}\n", stderr=""))
+    with pytest.raises(RuntimeError, match="digest mismatch"):
+        docker_env._validate_image_pin(
+            f"trusted.registry/name@sha256:{digest}", require_digest=True)
 
 def test_distinct_shared_keys_never_collide(monkeypatch):
     """Label sanitization is lossy — different raw keys MUST NOT resolve to

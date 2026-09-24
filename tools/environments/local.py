@@ -29,6 +29,7 @@ from tools.environments.local_gitbash_probe import (
     _looks_like_msys_spawn_failure, _mandatory_aslr_enabled)
 from tools.environments.local_pythonpath import (
     _build_hermes_repo_root_aliases, _strip_hermes_owned_pythonpath_and_runtime_markers)
+from tools.environments import sandbox_bwrap
 
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -933,6 +934,41 @@ class LocalEnvironment(BaseEnvironment):
                 self.cwd, safe_cwd)
         self.cwd = safe_cwd
 
+    def _sandbox_mode(self) -> str:
+        """Read the opt-in local sandbox mode; malformed config is safely off."""
+        try:
+            from hermes_cli.config import load_config
+            value = ((load_config() or {}).get("terminal") or {}).get("sandbox") or {}
+            mode = value.get("mode", "off") if isinstance(value, dict) else "off"
+            return mode if mode in {"off", "available", "require"} else "off"
+        except Exception:
+            return "off"
+
+    def _sandbox_command(self, args: list[str]) -> list[str]:
+        mode = self._sandbox_mode()
+        # Required mode is a hard security boundary: platform capability checks
+        # must happen before any early return that could execute raw argv.
+        if mode == "off":
+            return args
+        if mode == "require":
+            if _IS_WINDOWS:
+                raise sandbox_bwrap.SandboxUnavailable(
+                    "sandbox required but local bubblewrap is unavailable on Windows")
+            sandbox_bwrap.require_capabilities()
+        if _IS_WINDOWS:
+            return args
+        if not sandbox_bwrap.bwrap_available():
+            logger.warning("terminal sandbox requested but bwrap is unavailable; running unsandboxed")
+            return args
+        # Until projection supplies a narrower scope, only the current working
+        # directory is writable. System/toolchain paths are read-only mounts.
+        wrapped = sandbox_bwrap.build_bwrap_argv(
+            read_paths=["/usr", "/lib", "/lib64", "/etc/alternatives"],
+            write_paths=[self.cwd], toolchain_ro_dirs=[], network=False, cmd=args)
+        return sandbox_bwrap.build_landlock_wrapper_argv(
+            ro_paths=["/usr", "/lib", "/lib64", "/etc/alternatives"],
+            rw_paths=[self.cwd], cmd=wrapped)
+
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
@@ -941,6 +977,7 @@ class LocalEnvironment(BaseEnvironment):
         if login:
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
+        args = self._sandbox_command(args)
         self._recover_cwd()
         proc = subprocess.Popen(
             args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",

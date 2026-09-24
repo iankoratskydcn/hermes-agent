@@ -360,6 +360,8 @@ DEFAULT_CONFIG = {
         # anything under `--init` or `--security-opt no-new-privileges` ("operation not
         # permitted"). True drops those two flags; every other hardening stays. See #9730.
         "docker_snap_compat": False,
+        # Refuse mutable image tags and verify the daemon-resolved RepoDigest before launch.
+        "docker_require_digest_pin": False,
         # Trusted profiles sharing one Docker container identity; empty = per-profile boundary.
         "docker_shared_container_key": "",
         # Keep a long-lived bash shell across execute() calls so cwd/env/shell variables survive.
