@@ -35,7 +35,8 @@ def _fabricate_routed_entry(task_index: int, sidecar_result: dict) -> Dict[str, 
         "error": None, "api_calls": 0, "duration_seconds": 0,
         "model": None, "tokens": {"input": 0, "output": 0}, "tool_trace": [],
         "cost_usd": 0.0, "cost_status": "sidecar_routed",
-        "_sidecar_operation": sidecar_result.get("operation"), "_child_role": None, "_child_cost_usd": 0.0,
+        "_sidecar_operation": sidecar_result.get("operation"), "_sidecar_backend": sidecar_result.get("_backend"),
+        "_child_role": None, "_child_cost_usd": 0.0,
     }
 
 

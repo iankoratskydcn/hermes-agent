@@ -2290,7 +2290,8 @@ def _dispatch_lane_task(
                     with _kb.write_txn(conn):
                         _kb._append_event(
                             conn, task_id, "sidecar_routed",
-                            {"operation": sidecar_result.get("operation")},
+                            {"operation": sidecar_result.get("operation"),
+                             "backend": sidecar_result.get("_backend")},
                         )
                     _kb.complete_task(
                         conn, task_id,

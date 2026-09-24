@@ -373,6 +373,17 @@ model:
 kanban:
   review_dispatch: true
 
+# sidecar_service: opt-in remote HTTP backend for kanban.sidecar_routing_enabled's
+# auto-routing (hermes_cli/kanban_sidecar_route.py). Leave url empty (default) to keep
+# routing in-process against a local sidecars checkout. Set url to route over HTTP to a
+# sidecar_service instance on another host (e.g. Tailscale). api_key_env names an env
+# var (in .env) holding that instance's Bearer token -- never put the key itself here.
+# sidecar_service:
+#   url: "http://100.x.x.x:8765"
+#   api_key_env: "SIDECAR_SERVICE_API_KEY"
+#   timeout_s: 5
+
+
 # =============================================================================
 # Terminal Tool Configuration
 # =============================================================================

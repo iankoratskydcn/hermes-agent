@@ -1939,6 +1939,17 @@ DEFAULT_CONFIG = {
         # an operator must explicitly enable this, same as gate_precheck_enabled above.
         "sidecar_routing_enabled": False,
     },
+    # sidecar_service: HTTP backend for kanban_sidecar_route.py's auto-routing (a
+    # locally- or remotely-run sidecar_service instance; see mcp_servers.sidecar_service
+    # for the separate MCP-tool path the model uses directly). Empty url (default) keeps
+    # the existing in-process sidecar_suite.contract.execute() path unchanged. Setting
+    # url switches kanban_sidecar_route.py to HTTP against that instance (e.g. a
+    # Tailscale-bound host) -- see hermes_cli/sidecar_client.py.
+    "sidecar_service": {
+        "url": "",
+        "api_key_env": "SIDECAR_SERVICE_API_KEY",
+        "timeout_s": 5,
+    },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
     # agents on other connections wait in an on-disk outbox until the Desktop drains them.
     "bot_mode": {
