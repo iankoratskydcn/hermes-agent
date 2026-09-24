@@ -5,11 +5,18 @@ opt-in config flag (``kanban.sidecar_routing_enabled``, default ``False``), enfo
 the same dispatch-time guard slot as the gate precheck
 (``hermes_cli/kanban_db_dispatch.py::_dispatch_lane_task``).
 
-Per the architecture-correction comment on t_9dbf5547: the adoption path is the
-in-process ``sidecar_suite.contract.execute()`` call sidecar_service's own stdio MCP
-entrypoint uses (``sidecar_service/mcp_entrypoint.py``) -- NOT the Tailscale/HTTP
-service. Both this dispatch loop and the MCP server run on the same host, so the
-in-process path is strictly simpler (ponytail rung 1-2: reuse what already exists).
+Two dispatch backends, chosen by whether ``sidecar_service.url`` is configured:
+
+- **In-process** (default, url unset): the in-process ``sidecar_suite.contract.execute()``
+  call sidecar_service's own stdio MCP entrypoint uses
+  (``sidecar_service/mcp_entrypoint.py``). Simplest when this dispatch loop and the
+  sidecar_service checkout are on the same host (ponytail rung 1-2: reuse what already
+  exists).
+- **Remote** (url set): HTTP against a sidecar_service instance on another host (e.g. a
+  Tailscale-bound mini PC) via ``hermes_cli/sidecar_client.py``. Operation metadata
+  (idea_id, schemas) comes from that instance's own ``GET /v1/operations`` rather than
+  the local checkout's registry, since only the remote host's enabled/disabled state is
+  authoritative for what it will actually run.
 
 Eligibility registry (``SIDECAR_ELIGIBLE_OPERATIONS``) starts EMPTY on purpose: a
 kanban task's only shape is title/body/labels, and none of sidecar_service's 99
@@ -52,6 +59,16 @@ def sidecar_routing_enabled(kanban_cfg: Optional[dict] = None) -> bool:
     if not isinstance(kanban_cfg, dict):
         kanban_cfg = {}
     return bool(kanban_cfg.get("sidecar_routing_enabled", False))
+
+
+def _sidecar_service_config() -> dict:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config().get("sidecar_service") or {}
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
 
 
 def _sidecar_repo_root() -> Optional[Path]:
@@ -129,15 +146,54 @@ def _build_envelope(operation_name: str, idea_id: int, input_schema: str, output
 
 
 def try_sidecar_route(task: Any) -> Optional[dict]:
-    """Attempt the cheap-first sidecar path for one task: classify, dispatch in-process,
-    return the sidecar's result dict on an ``ok`` outcome, else None (fall through to a
-    normal spawn/subagent unchanged). Never raises -- any failure here is a fall-through,
-    matching agent/auxiliary_client.py's provider-fallback-chain shape ("try cheap first,
-    fall through on ineligibility/failure")."""
+    """Attempt the cheap-first sidecar path for one task: classify, dispatch (remote HTTP
+    if ``sidecar_service.url`` is configured, else in-process), return the sidecar's result
+    dict (tagged with ``_backend``: ``"remote"``/``"in_process"``) on an ``ok`` outcome, else
+    None (fall through to a normal spawn/subagent unchanged). Never raises -- any failure
+    here is a fall-through, matching agent/auxiliary_client.py's provider-fallback-chain
+    shape ("try cheap first, fall through on ineligibility/failure")."""
     classified = classify_task_for_sidecar(task)
     if classified is None:
         return None
     operation_name, input_payload = classified
+
+    sidecar_cfg = _sidecar_service_config()
+    if str(sidecar_cfg.get("url") or "").strip():
+        result = _try_remote_route(operation_name, input_payload, sidecar_cfg)
+    else:
+        result = _try_in_process_route(operation_name, input_payload)
+    if result is None or result.get("status") != "ok":
+        return None
+    return result
+
+
+def _try_remote_route(operation_name: str, input_payload: dict, sidecar_cfg: dict) -> Optional[dict]:
+    from hermes_cli import sidecar_client
+
+    operations = sidecar_client.list_operations(sidecar_cfg)
+    if operations is None:
+        return None
+    op_meta = next(
+        (o for o in (operations.get("operations") or []) if o.get("operation") == operation_name),
+        None,
+    )
+    if op_meta is None or not op_meta.get("enabled", False):
+        return None
+    try:
+        envelope = _build_envelope(
+            operation_name, op_meta["idea_id"], op_meta["input_schema"], op_meta["output_schema"],
+            input_payload,
+        )
+        result = sidecar_client.execute_remote(envelope, sidecar_cfg)
+    except Exception:
+        return None
+    if result is None:
+        return None
+    result["_backend"] = "remote"
+    return result
+
+
+def _try_in_process_route(operation_name: str, input_payload: dict) -> Optional[dict]:
     modules = _load_sidecar_modules()
     if modules is None:
         return None
@@ -155,6 +211,5 @@ def try_sidecar_route(task: Any) -> Optional[dict]:
         result = modules["execute"](envelope, registry, event_sink=lambda _e: None)
     except Exception:
         return None
-    if result.get("status") != "ok":
-        return None
+    result["_backend"] = "in_process"
     return result
