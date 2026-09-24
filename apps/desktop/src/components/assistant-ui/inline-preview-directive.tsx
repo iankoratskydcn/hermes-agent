@@ -20,11 +20,14 @@ import { localPreviewTarget } from '@/lib/local-preview'
  * SIZE IS CONTENT-DRIVEN. The opaque origin means the parent can't measure
  * the document, but we own the srcdoc string — an injected script posts the
  * content's size up via postMessage (tagged with a per-mount token). Height
- * tracks live within the clamp band; width adopts ONCE from the first
- * report, so a fixed-size widget shrink-wraps and sits left in the message
- * flow like an image, while a fluid page measures the full viewport and
- * stays column-wide. A `height="480"` attribute only sets the starting
- * height — measurement always wins.
+ * tracks live within the clamp band; width adopts the running MAX across
+ * reports (never shrinks, can grow) so a fixed-size widget shrink-wraps and
+ * sits left in the message flow like an image, while a fluid page measures
+ * the full viewport and stays column-wide, and content mounted/reflowed
+ * after the first report (e.g. a second, wider element appended later in
+ * the same document) can still widen the frame instead of being clamped to
+ * whatever the first report happened to measure. A `height="480"` attribute
+ * only sets the starting height — measurement always wins.
  *
  * NATIVE BY DEFAULT. A theme prelude injects first: the app's resolved
  * theme tokens under friendly names (--foreground, --muted-foreground,
@@ -356,12 +359,17 @@ function InlineHtmlFrame({
         Math.abs(next.height - (prev ?? initialHeight ?? DEFAULT_HEIGHT)) > RESIZE_TOLERANCE ? next.height : prev
       )
 
-      // Width adopts ONCE, from the first report — measured at full column
-      // width, so it is the content's intrinsic span. Tracking width live
-      // would feedback-loop: %-width children reflow narrower every time
-      // the frame shrinks, spiraling toward zero.
+      // Width only ever grows, never shrinks after being set. Tracking width
+      // fully live would feedback-loop: %-width children reflow narrower
+      // every time the frame shrinks, spiraling toward zero. But locking to
+      // the FIRST report alone starves content mounted/reflowed later in the
+      // same document (e.g. a second, wider diagram appended after an
+      // initial narrow heading) — it gets clamped to that first, smaller
+      // span forever. Taking the running max preserves the anti-collapse
+      // guarantee (a later narrower report can't shrink it) while still
+      // letting genuinely wider later content widen the frame.
       if (next.width > 0) {
-        setContentWidth(prev => prev ?? next.width)
+        setContentWidth(prev => (prev === null ? next.width : Math.max(prev, next.width)))
       }
     }
 
