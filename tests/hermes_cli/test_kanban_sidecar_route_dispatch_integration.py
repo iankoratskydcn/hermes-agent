@@ -150,3 +150,61 @@ class TestSidecarRouteSecretScope:
             kbd.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
 
         assert spawns == [task_id]
+
+
+class TestSidecarRouteUsesDispatcherOwnScope:
+    """Regression for the second, worse bug found after the first fix shipped:
+    _dispatch_lane_task originally bound the TASK'S ASSIGNEE's profile secret
+    scope around try_sidecar_route() (copying the worker-spawn-env pattern
+    used elsewhere in this function). sidecar_service.api_key_env is a
+    DISPATCHER-owned credential -- one config.yaml block, one .env entry in
+    the launch/root profile -- not a per-profile secret. Binding the
+    assignee's scope silently resolved an EMPTY key for any profile that
+    isn't the launch profile: no exception (get_secret returns "" cleanly),
+    every real HTTP call 401'd, and _request()'s own error handling correctly
+    swallowed that into a return-None. Every dispatch-level test above still
+    passed because they all mock try_sidecar_route() directly and never
+    exercise the real secret-scope plumbing around it -- this is the one gap
+    that could only be caught by watching a live remote call actually fail
+    with api_key_len=0 in production. Never again: assert the scope bound
+    around the call is the dispatcher's own launch scope."""
+
+    def test_launch_secret_scope_is_bound_not_a_per_assignee_scope(
+        self, kanban_home, all_assignees_spawnable, monkeypatch,
+    ):
+        import agent.secret_scope as secret_scope_mod
+
+        _config_with_sidecar_routing(monkeypatch, True)
+
+        calls: list = []
+        real_set_scope = secret_scope_mod.set_secret_scope
+
+        def _spy_set_secret_scope(scope, **kwargs):
+            calls.append((scope, kwargs))
+            return real_set_scope(scope, **kwargs)
+
+        monkeypatch.setattr(secret_scope_mod, "set_secret_scope", _spy_set_secret_scope)
+        monkeypatch.setattr(
+            sidecar_route, "try_sidecar_route",
+            lambda task: {"operation": "json_field_extract", "_backend": "remote",
+                          "payload": {"name": "x"}},
+        )
+
+        spawns: list = []
+        with kbc.connect() as conn:
+            # Assignee deliberately NOT the launch profile -- this is exactly
+            # the shape that silently 401'd in production.
+            task_id = kb.create_task(
+                conn, title="sidecar:json_field_extract", assignee="alice",
+            )
+            kbd.dispatch_once(conn, spawn_fn=_fake_spawn_factory(spawns))
+
+        assert len(calls) == 1, "must bind exactly one secret scope for the sidecar call"
+        _scope, kwargs = calls[0]
+        # The prior (wrong) fix passed profile_home=str(assignee's home); the
+        # correct binding always passes profile_home=None (launch scope has no
+        # separate profile_home the way a routed worker's does).
+        assert kwargs.get("profile_home") is None, (
+            "sidecar route must bind the DISPATCHER's own launch scope "
+            "(profile_home=None), never the task assignee's profile scope"
+        )

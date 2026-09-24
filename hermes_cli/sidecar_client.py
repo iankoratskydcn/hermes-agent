@@ -21,7 +21,15 @@ _operations_cache: dict[str, Any] = {"result": None, "fetched_at": 0.0, "url": N
 def _resolve_api_key(api_key_env: str) -> str:
     from agent.secret_scope import get_secret
 
-    return (get_secret(api_key_env) or "").strip()
+    try:
+        return (get_secret(api_key_env) or "").strip()
+    except Exception:
+        # Module docstring promises "never raises" so every caller can rely on a
+        # clean fall-through; get_secret() alone can raise UnscopedSecretError
+        # on a multiplexed gateway when no profile secret scope is bound around
+        # this call (e.g. a dispatcher tick that forgot to bind one) -- treat
+        # that exactly like "key not configured" rather than propagating it.
+        return ""
 
 
 def _request(url: str, api_key: str, timeout_s: float, data: Optional[bytes] = None) -> Optional[dict]:

@@ -2291,15 +2291,26 @@ def _dispatch_lane_task(
             # for SIDECAR_SERVICE_API_KEY needs an explicit bound scope on a
             # multiplexed gateway or it raises UnscopedSecretError and crashes
             # the whole tick for every task behind this one, not just this task.
-            from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+            #
+            # sidecar_service.api_key_env is a DISPATCHER-owned credential (lives
+            # in the launch/root profile's .env, config.yaml has one global
+            # sidecar_service: block, not a per-profile one) -- bind the
+            # DISPATCHER'S OWN launch scope here, never the task's assignee. An
+            # earlier version of this fix bound the assignee's profile scope
+            # (copying the worker-spawn-env pattern below), which left
+            # get_secret() resolving an empty key from a profile that never had
+            # this secret at all: every remote call 401'd and silently fell
+            # through to a full agent spawn, never actually detected because
+            # try_sidecar_route()'s own "never raises" contract swallowed it.
+            from agent.secret_scope import reset_secret_scope, set_secret_scope
+            from hermes_constants import get_process_hermes_home
+            from tui_gateway.launch_profile_policy import launch_secret_scope
+
+            launch_home = Path(get_process_hermes_home())
+            secret_token = None
             try:
-                profile_home = resolve_profile_env(normalize_profile_name(assignee))
-            except FileNotFoundError:
-                profile_home = None
-            try:
-                with (_worker_profile_scope(profile_home, bind_home=False) if profile_home
-                      else contextlib.nullcontext()):
-                    sidecar_result = _sidecar_route.try_sidecar_route(task_for_sidecar)
+                secret_token = set_secret_scope(launch_secret_scope(launch_home), profile_home=None)
+                sidecar_result = _sidecar_route.try_sidecar_route(task_for_sidecar)
             except Exception:
                 # Fail closed exactly like an ineligible/failed route: fall
                 # through to a normal spawn rather than losing the whole tick.
@@ -2308,6 +2319,9 @@ def _dispatch_lane_task(
                     "through to normal spawn", task_id,
                 )
                 sidecar_result = None
+            finally:
+                if secret_token is not None:
+                    reset_secret_scope(secret_token)
             if sidecar_result is not None:
                 if not dry_run:
                     with _kb.write_txn(conn):
