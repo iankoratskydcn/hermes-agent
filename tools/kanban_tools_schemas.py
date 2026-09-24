@@ -146,8 +146,8 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "Optional list of absolute paths to deliverable "
                 "files you produced during this run — generated "
                 "charts, PDFs, spreadsheets, images, archives. "
-                "Examples: [\"/tmp/q3-revenue.png\", "
-                "\"/tmp/report.pdf\"]. The gateway notifier "
+                "Examples: [\"~/.hermes/cache/scratch/q3-revenue.png\", "
+                "\"~/.hermes/cache/scratch/report.pdf\"]. The gateway notifier "
                 "uploads each path as a native attachment to the "
                 "subscribed chat (images embed inline, everything "
                 "else uploads as a file) so the deliverable "
@@ -238,7 +238,7 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
                 "Optional list of absolute paths to deliverable "
                 "files this handoff names — generated charts, "
                 "PDFs, spreadsheets, images, archives. Examples: "
-                "['/tmp/q3-revenue.png', '/tmp/report.pdf']. "
+                "['~/.hermes/cache/scratch/q3-revenue.png', '~/.hermes/cache/scratch/report.pdf']. "
                 "A review handoff is the last implementer "
                 "transition, so the kernel copies these into the "
                 "task's durable attachments before the reviewer's "
@@ -496,12 +496,17 @@ KANBAN_CREATE_SCHEMA = _schema(
         )),
         "provider": _prop("string", (
                 "Provider the 'model' belongs to (e.g. 'openrouter', "
-                "'anthropic', 'nous'). Set this whenever the model "
-                "is not from the assignee profile's configured "
+                "'anthropic', 'nous'). Set this whenever the "
+                "model is not from the assignee profile's configured "
                 "provider — a model name alone is resolved against "
                 "the profile's provider and will fail if it belongs "
                 "to a different one. Requires 'model'."
         )),
+        "obligations": {
+            "type": "array", "items": {"type": "string"},
+            "description": "Frozen REQ-* obligation identifiers evaluated by run_contract_tests.",
+        },
+        "feedback_schema": _prop("string", "Contract-test feedback schema; matrix is the only supported dev-facing form."),
     },
     ["title", "assignee"],
 )
@@ -519,6 +524,14 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
     },
     ["task_id"],
 )
+
+KANBAN_RUN_CONTRACT_TESTS_SCHEMA = _schema(
+    "run_contract_tests",
+    "Run the task's frozen contract obligations in the dispatcher-owned sandbox and return only PASS/FAIL obligation results. Available only to single-blind development workers.",
+    {},
+    [],
+)
+
 
 KANBAN_LINK_SCHEMA = _schema(
     "kanban_link",
