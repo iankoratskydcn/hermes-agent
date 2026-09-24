@@ -25,6 +25,13 @@ def _resolve_api_key(api_key_env: str) -> str:
 
 
 def _request(url: str, api_key: str, timeout_s: float, data: Optional[bytes] = None) -> Optional[dict]:
+    # Scheme allowlist: urllib.request.urlopen honors whatever scheme the URL declares
+    # (file://, ftp://, ...), not just http(s) -- an unchecked scheme lets a misconfigured
+    # or attacker-influenced sidecar_service.url read local files or hit a non-HTTP
+    # service instead of the intended API, and file:// responses crash uncaught below
+    # (no .status), violating this function's own never-raises contract.
+    if not url.lower().startswith(("http://", "https://")):
+        return None
     req = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET")
     req.add_header("Authorization", f"Bearer {api_key}")
     if data is not None:
@@ -34,7 +41,7 @@ def _request(url: str, api_key: str, timeout_s: float, data: Optional[bytes] = N
             if resp.status < 200 or resp.status >= 300:
                 return None
             body = resp.read().decode("utf-8")
-    except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError):
+    except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError, ValueError):
         return None
     try:
         parsed = json.loads(body)

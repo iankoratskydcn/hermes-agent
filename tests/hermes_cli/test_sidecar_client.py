@@ -104,6 +104,19 @@ def test_api_key_never_appears_in_exception_message():
             assert "super-secret-token" not in str(exc)
 
 
+def test_non_http_scheme_rejected_without_network_call():
+    """file:// (or any non-http(s) scheme) must never reach urlopen: urlopen honors
+    whatever scheme a URL declares, so an unchecked scheme could read local files or
+    hit a non-HTTP service instead of the intended API -- and a file:// response has
+    no .status, which crashed this function uncaught before the scheme check existed."""
+    for scheme_url in ("file:///etc/hostname", "ftp://127.0.0.1:8765", "100.66.2.21:8765", ""):
+        with patch.object(sidecar_client, "_resolve_api_key", return_value="tok"), \
+             patch("urllib.request.urlopen") as mock_urlopen:
+            assert sidecar_client.execute_remote(json.dumps({"operation": "foo"}),
+                                                  {**_CFG, "url": scheme_url}) is None
+        mock_urlopen.assert_not_called()
+
+
 def test_resolve_api_key_uses_secret_scope_not_bare_env(monkeypatch):
     monkeypatch.setenv("SIDECAR_SERVICE_API_KEY", "leaked-if-bare-getenv")
     with patch("agent.secret_scope.get_secret", return_value="scoped-value") as mock_get_secret:
