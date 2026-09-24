@@ -35,6 +35,9 @@ data/
 # Bundled community plugin index seed (shipped as package data) — the bare
 # `data/` pattern above would otherwise swallow it.
 !hermes_cli/data/
+# The Connectors page's wire layer (apps/desktop/src/app/capabilities/connectors/data/)
+# — same reason: the bare `data/` pattern above would otherwise swallow it.
+!apps/desktop/src/app/capabilities/connectors/data/
 .pytest_cache/
 test_durations.json
 .pytest-cache/
@@ -302,3 +305,4 @@ native/fts5_cjk/*.so
 # Disposable profile created by scripts/probe_active_session_exclusivity.py
 .probe-home/
 .fork_sync_pipeline_branch
+.venv_check/

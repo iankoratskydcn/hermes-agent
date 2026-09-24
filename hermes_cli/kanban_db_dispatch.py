@@ -73,8 +73,14 @@ TERMINAL_WORKER_REAP_GRACE_SECONDS = 120
 
 # Patterns in last_failure_error that indicate a quota / auth blocker.
 # These errors won't resolve by retrying immediately — auto-block instead.
+# The auth family is a curated list, not an open `auth\w*` stem: that stem
+# also matched ordinary English words like "author"/"authored"/"authoring"/
+# "authoritative" in worker progress prose, parking a healthy card forever
+# (#117009).
 _RESPAWN_BLOCKER_RE = re.compile(
-    r"\b(quota|rate[\s_\-]?limit|429|403|auth\w*|"
+    r"\b(quota|rate[\s_\-]?limit|429|403|"
+    r"auth|authenticat(?:e|es|ed|ing|ion)|authoriz(?:e|es|ed|ing|ation)|"
+    r"authoris(?:e|es|ed|ing|ation)|authz|"
     r"unauthorized|forbidden|billing|subscription|"
     r"access[\s_]denied|permission[\s_]denied|"
     r"invalid[\s_]api[\s_]key)\b",
@@ -146,6 +152,15 @@ class DispatchResult:
     ``kanban.gate_precheck_enabled`` is set in ``config.yaml``. Distinct from
     ``respawn_guarded`` (a different, always-on mechanism) so telemetry can
     tell them apart."""
+    provider_budget_blocked: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` refused because the assignee's provider account
+    (``kanban.provider_budgets``, see ``kanban_provider_budget.py``) is over
+    its rolling rate-limit budget. Pools ``rate_limited`` outcomes across
+    EVERY profile in the account, so this can trip on a hit recorded under a
+    DIFFERENT profile than ``task_id``'s own assignee -- the mechanism
+    ``respawn_guarded``'s per-task ``rate_limit_cooldown`` cannot express.
+    Opt-in; empty unless ``kanban.provider_budgets`` configures at least one
+    account."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -1613,9 +1628,13 @@ def check_respawn_guard(
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
-    err = row["last_failure_error"]
-    if err and _RESPAWN_BLOCKER_RE.search(err):
+    # 2. Quota / auth blocker: retrying immediately will not help.  A plain
+    # crash is different: its persisted error includes the worker's last
+    # captured output, which is context rather than a diagnosis and may contain
+    # benign commands such as ``claude auth status`` (#117097).
+    err = _kb._lossy_text(row["last_failure_error"])
+    latest_outcome = latest_run["outcome"] if latest_run is not None else None
+    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
@@ -1658,7 +1677,8 @@ def check_respawn_guard(
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
-        if not (c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])):
+        body = _kb._lossy_text(c["body"])
+        if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
             continue
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
@@ -2274,6 +2294,90 @@ def _dispatch_lane_task(
             if precheck["status"] == _gate_precheck.STATUS_BLOCKED:
                 result.skipped_gate_precheck.append((task_id, precheck["reason"]))
                 return False
+
+    # Rolling-window provider-quota guard (kanban.provider_budgets): pools
+    # rate-limited exits across every profile sharing one provider account so
+    # a fan-out can't hammer the same 429 wall from N independent per-task
+    # cooldowns. Cheap short-circuit when no account is configured (default).
+    from hermes_cli import kanban_provider_budget as _provider_budget
+    try:
+        from hermes_cli.config import load_config as _load_config_for_budget
+        _budget_kanban_cfg = _load_config_for_budget().get("kanban") or {}
+    except Exception:
+        _budget_kanban_cfg = {}
+    if _provider_budget.provider_budgets_enabled(_budget_kanban_cfg):
+        budget_reason = _provider_budget.check_provider_budget(
+            conn, assignee, kanban_cfg=_budget_kanban_cfg,
+        )
+        if budget_reason is not None:
+            result.provider_budget_blocked.append((task_id, budget_reason))
+            if not dry_run:
+                with _kb.write_txn(conn):
+                    _kb._append_event(conn, task_id, "provider_budget_blocked", {"reason": budget_reason})
+            return False
+
+    # Sidecar-Adoption STEP 3a: opt-in pre-spawn interception. Same shape as the gate
+    # precheck above -- pure classify, cheap in-process dispatch, fall through to a normal
+    # spawn on ineligibility/failure. kanban.sidecar_routing_enabled in config.yaml, default
+    # False. On a real sidecar "ok" result, write it via the existing complete_task path and
+    # skip _call_spawn_fn entirely (never Popen a full worker for this task).
+    if _sidecar_route.sidecar_routing_enabled():
+        task_for_sidecar = _kb.get_task(conn, task_id)
+        sidecar_result = None
+        if task_for_sidecar is not None:
+            # Same profile-scoping requirement as every other dispatch-side secret
+            # read (see _worker_profile_scope docstring): the dispatcher runs
+            # detached from any turn, so try_sidecar_route()'s get_secret() call
+            # for SIDECAR_SERVICE_API_KEY needs an explicit bound scope on a
+            # multiplexed gateway or it raises UnscopedSecretError and crashes
+            # the whole tick for every task behind this one, not just this task.
+            #
+            # sidecar_service.api_key_env is a DISPATCHER-owned credential (lives
+            # in the launch/root profile's .env, config.yaml has one global
+            # sidecar_service: block, not a per-profile one) -- bind the
+            # DISPATCHER'S OWN launch scope here, never the task's assignee. An
+            # earlier version of this fix bound the assignee's profile scope
+            # (copying the worker-spawn-env pattern below), which left
+            # get_secret() resolving an empty key from a profile that never had
+            # this secret at all: every remote call 401'd and silently fell
+            # through to a full agent spawn, never actually detected because
+            # try_sidecar_route()'s own "never raises" contract swallowed it.
+            from agent.secret_scope import reset_secret_scope, set_secret_scope
+            from hermes_constants import get_process_hermes_home
+            from tui_gateway.launch_profile_policy import launch_secret_scope
+
+            launch_home = Path(get_process_hermes_home())
+            secret_token = None
+            try:
+                secret_token = set_secret_scope(launch_secret_scope(launch_home), profile_home=None)
+                sidecar_result = _sidecar_route.try_sidecar_route(task_for_sidecar)
+            except Exception:
+                # Fail closed exactly like an ineligible/failed route: fall
+                # through to a normal spawn rather than losing the whole tick.
+                _kb._log.exception(
+                    "kanban dispatcher: sidecar route raised for task %s, falling "
+                    "through to normal spawn", task_id,
+                )
+                sidecar_result = None
+            finally:
+                if secret_token is not None:
+                    reset_secret_scope(secret_token)
+            if sidecar_result is not None:
+                if not dry_run:
+                    with _kb.write_txn(conn):
+                        _kb._append_event(
+                            conn, task_id, "sidecar_routed",
+                            {"operation": sidecar_result.get("operation"),
+                             "backend": sidecar_result.get("_backend")},
+                        )
+                    _kb.complete_task(
+                        conn, task_id,
+                        result=json.dumps(sidecar_result.get("payload")),
+                        summary=f"Auto-routed to sidecar_service operation {sidecar_result.get('operation')!r}.",
+                        metadata={"sidecar_result": sidecar_result},
+                    )
+                result.spawned.append((task_id, assignee, ""))
+                return True
 
     # Rule 4 (no-infinite-retry): once consecutive_failures hits
     # RETRY_CAP_ESCALATION_THRESHOLD, escalate to a PO via decision-hud
@@ -3054,6 +3158,52 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
+@contextlib.contextmanager
+def _worker_profile_scope(hermes_home: str, *, bind_home: bool = True):
+    """Bind an assigned profile's runtime scope (secrets + terminal policy, optionally home) for
+    one dispatch-side read or spawn-env build.
+
+    The dispatcher runs detached from any turn, so nothing binds a profile for it: ``load_config``,
+    the toolset probes' ``get_secret`` reads and ``build_subprocess_env``'s passthrough resolution
+    all fall back to the LAUNCH profile's ambient ``os.environ`` / ``TERMINAL_*``. Binding was
+    previously conditional on ``is_multiplex_active()``, so on a single-profile host a worker for
+    profile B was built entirely from the dispatcher's own environment.
+
+    ``bind_home=False`` for the spawn-env build: which variables may cross into a child is the
+    DISPATCHER's ``terminal.env_passthrough`` policy (#109494, read through the home override) —
+    only their VALUES come from the assignee's scope, so that branch binds the secret scope alone.
+    Toolset resolution binds the home and the terminal policy, as it always has.
+
+    The secret mapping is never widened: a profile that is not this process's own home gets its own
+    ``.env`` + external sources ONLY, while the launch home keeps its established
+    env-over-``.env`` precedence (``launch_secret_scope``) so systemd / ``op run`` injection still
+    resolves for a standalone dispatcher.
+    """
+    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+    from hermes_constants import get_process_hermes_home, reset_hermes_home_override, set_hermes_home_override
+    from tools.terminal_scope import install_profile_terminal_scope, reset_terminal_scope
+    from tui_gateway.launch_profile_policy import launch_secret_scope, launch_terminal_env
+
+    home = Path(hermes_home)
+    is_launch_home = str(home.resolve()) == str(Path(get_process_hermes_home()).resolve())
+    home_token = secret_token = terminal_token = None
+    try:
+        home_token = set_hermes_home_override(str(home)) if bind_home else None
+        secret_token = set_secret_scope(
+            launch_secret_scope(home) if is_launch_home else build_profile_secret_scope(home),
+            profile_home=None if is_launch_home else str(home))
+        terminal_token = install_profile_terminal_scope(
+            home, env_overlay=launch_terminal_env() if is_launch_home else None) if bind_home else None
+        yield
+    finally:
+        if terminal_token is not None:
+            reset_terminal_scope(terminal_token)
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+
+
 def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
     """Return the assigned profile's effective CLI toolsets for a worker.
 
@@ -3066,25 +3216,12 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
     if not hermes_home:
         return None
     try:
-        from agent.secret_scope import (
-            build_profile_secret_scope, is_multiplex_active, reset_secret_scope, set_secret_scope)
-        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_cli.config import load_config
         from hermes_cli.tools_config import _get_platform_tools
 
-        token = set_hermes_home_override(hermes_home)
-        # Toolset availability probes read credentials (``get_secret``); under multiplex an
-        # unscoped read raises and the pin was silently dropped for every worker.
-        secret_token = (
-            set_secret_scope(build_profile_secret_scope(Path(hermes_home)))
-            if is_multiplex_active() else None)
-        try:
+        with _worker_profile_scope(hermes_home):
             cfg = load_config()
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
-        finally:
-            if secret_token is not None:
-                reset_secret_scope(secret_token)
-            reset_hermes_home_override(token)
         return toolsets or None
     except Exception as exc:
         _kb._log.debug(
@@ -3227,9 +3364,8 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
 
     profile_arg = normalize_profile_name(task.assignee)
 
-    from agent.secret_scope import (
-        build_profile_secret_scope, is_multiplex_active, reset_secret_scope, set_secret_scope)
-    from tools.environments.local import build_subprocess_env, strip_launch_profile_env
+    from agent.secret_scope import is_multiplex_active
+    from tools.environments.local import _is_routed_home, build_subprocess_env, strip_launch_profile_env
 
     try:
         profile_home = resolve_profile_env(profile_arg)
@@ -3238,22 +3374,20 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         # HERMES_PROFILE (set below) instead.
         profile_home = None
 
-    multiplex_active = is_multiplex_active()
-    # build_subprocess_env's secret scrub resolves terminal.env_passthrough vars
-    # through get_secret(), which raises UnscopedSecretError with no profile scope
-    # installed while multiplexing is on — mirrors _resolve_worker_cli_toolsets's
-    # own scope-then-read ordering a few functions up in this module.
-    secret_token = (
-        set_secret_scope(build_profile_secret_scope(Path(profile_home)))
-        if multiplex_active and profile_home else None)
-    try:
+    # Scrub for a ROUTED home, not only under multiplex: the authority test is "does this worker act
+    # for another profile", exactly as served_profile_child_env decides it (tools/environments/local.py).
+    # Gating on the gateway-wide flag left B's worker inheriting the dispatcher's own OPENAI_API_KEY and
+    # systemd-injected tokens on every single-profile host.
+    routed = bool(profile_home) and _is_routed_home(profile_home)
+    # build_subprocess_env's secret scrub resolves terminal.env_passthrough vars through get_secret(),
+    # which without a bound scope reads the LAUNCH profile's ambient environment for a worker spawned
+    # on B's behalf (and raises under multiplex) — so bind B's secret scope around the build.
+    with (_worker_profile_scope(profile_home, bind_home=False) if profile_home
+          else contextlib.nullcontext()):
         env = build_subprocess_env(
-            scrub_secrets=multiplex_active,
+            scrub_secrets=is_multiplex_active() or routed,
             inherit_profile_home=True,
         )
-    finally:
-        if secret_token is not None:
-            reset_secret_scope(secret_token)
     # The dispatcher is detached from every conversation; its worker must never
     # inherit routing mirrored by a previous gateway turn.
     from gateway.session_context import _VAR_MAP
@@ -3420,3 +3554,4 @@ from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
 from hermes_cli import kanban_gate_precheck as _gate_precheck  # noqa: E402
+from hermes_cli import kanban_sidecar_route as _sidecar_route  # noqa: E402
