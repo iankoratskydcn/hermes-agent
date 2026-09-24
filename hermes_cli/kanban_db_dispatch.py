@@ -146,6 +146,15 @@ class DispatchResult:
     ``kanban.gate_precheck_enabled`` is set in ``config.yaml``. Distinct from
     ``respawn_guarded`` (a different, always-on mechanism) so telemetry can
     tell them apart."""
+    provider_budget_blocked: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, reason)`` refused because the assignee's provider account
+    (``kanban.provider_budgets``, see ``kanban_provider_budget.py``) is over
+    its rolling rate-limit budget. Pools ``rate_limited`` outcomes across
+    EVERY profile in the account, so this can trip on a hit recorded under a
+    DIFFERENT profile than ``task_id``'s own assignee -- the mechanism
+    ``respawn_guarded``'s per-task ``rate_limit_cooldown`` cannot express.
+    Opt-in; empty unless ``kanban.provider_budgets`` configures at least one
+    account."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -2275,6 +2284,27 @@ def _dispatch_lane_task(
             if precheck["status"] == _gate_precheck.STATUS_BLOCKED:
                 result.skipped_gate_precheck.append((task_id, precheck["reason"]))
                 return False
+
+    # Rolling-window provider-quota guard (kanban.provider_budgets): pools
+    # rate-limited exits across every profile sharing one provider account so
+    # a fan-out can't hammer the same 429 wall from N independent per-task
+    # cooldowns. Cheap short-circuit when no account is configured (default).
+    from hermes_cli import kanban_provider_budget as _provider_budget
+    try:
+        from hermes_cli.config import load_config as _load_config_for_budget
+        _budget_kanban_cfg = _load_config_for_budget().get("kanban") or {}
+    except Exception:
+        _budget_kanban_cfg = {}
+    if _provider_budget.provider_budgets_enabled(_budget_kanban_cfg):
+        budget_reason = _provider_budget.check_provider_budget(
+            conn, assignee, kanban_cfg=_budget_kanban_cfg,
+        )
+        if budget_reason is not None:
+            result.provider_budget_blocked.append((task_id, budget_reason))
+            if not dry_run:
+                with _kb.write_txn(conn):
+                    _kb._append_event(conn, task_id, "provider_budget_blocked", {"reason": budget_reason})
+            return False
 
     # Sidecar-Adoption STEP 3a: opt-in pre-spawn interception. Same shape as the gate
     # precheck above -- pure classify, cheap in-process dispatch, fall through to a normal

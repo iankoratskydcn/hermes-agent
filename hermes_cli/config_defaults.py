@@ -1945,6 +1945,19 @@ DEFAULT_CONFIG = {
         # (hermes_cli/kanban_sidecar_route.py). False (default) = always spawn normally;
         # an operator must explicitly enable this, same as gate_precheck_enabled above.
         "sidecar_routing_enabled": False,
+        # Rolling-window provider-quota guard (hermes_cli/kanban_provider_budget.py):
+        # maps profiles that share ONE provider account's credentials to a shared
+        # rate-limit budget, so a fan-out across those profiles pauses dispatch to the
+        # WHOLE account after max_rate_limit_hits 429s within window_seconds, instead of
+        # each task independently bouncing off the same quota wall. Empty (default) =
+        # off; an operator must explicitly map an account's profiles to opt in, same
+        # rationale as gate_precheck_enabled/sidecar_routing_enabled above. Example:
+        #   provider_budgets:
+        #     shared-openai-key:
+        #       profiles: ["alice", "bob"]
+        #       max_rate_limit_hits: 3   # default 3
+        #       window_seconds: 3600     # default 3600 (1 hour)
+        "provider_budgets": {},
     },
     # sidecar_service: HTTP backend for kanban_sidecar_route.py's auto-routing (a
     # locally- or remotely-run sidecar_service instance; see mcp_servers.sidecar_service
