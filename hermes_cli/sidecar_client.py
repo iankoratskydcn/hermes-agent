@@ -23,12 +23,24 @@ def _resolve_api_key(api_key_env: str) -> str:
 
     try:
         return (get_secret(api_key_env) or "").strip()
-    except Exception:
+    except Exception as exc:
         # Module docstring promises "never raises" so every caller can rely on a
-        # clean fall-through; get_secret() alone can raise UnscopedSecretError
-        # on a multiplexed gateway when no profile secret scope is bound around
-        # this call (e.g. a dispatcher tick that forgot to bind one) -- treat
-        # that exactly like "key not configured" rather than propagating it.
+        # clean fall-through -- but a fall-through here is otherwise SILENT and
+        # indistinguishable from "sidecar not configured": get_secret() can raise
+        # UnscopedSecretError on a multiplexed gateway when no profile secret
+        # scope is bound around this call (e.g. a dispatcher tick that forgot to
+        # bind one). Log once so the actual cause (missing scope binding, not
+        # missing config) is visible instead of manifesting only as "the sidecar
+        # never routes" with zero diagnostic trail.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "sidecar_client: could not resolve secret %r (%s: %s) -- treating as "
+            "unconfigured and falling through to the caller's non-sidecar path",
+            api_key_env,
+            type(exc).__name__,
+            exc,
+        )
         return ""
 
 

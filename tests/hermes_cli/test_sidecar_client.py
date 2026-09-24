@@ -123,3 +123,20 @@ def test_resolve_api_key_uses_secret_scope_not_bare_env(monkeypatch):
         key = sidecar_client._resolve_api_key("SIDECAR_SERVICE_API_KEY")
     mock_get_secret.assert_called_once_with("SIDECAR_SERVICE_API_KEY")
     assert key == "scoped-value"
+
+
+def test_resolve_api_key_logs_warning_on_unscoped_secret_error(caplog):
+    """A raised get_secret() (e.g. UnscopedSecretError with no profile scope
+    bound around this call) must fall through to "" like documented, but must
+    NOT do so silently -- an unlogged fall-through here is indistinguishable
+    from "sidecar not configured" and leaves zero diagnostic trail."""
+    class _Boom(Exception):
+        pass
+
+    with patch("agent.secret_scope.get_secret", side_effect=_Boom("no bound scope")):
+        with caplog.at_level("WARNING", logger="hermes_cli.sidecar_client"):
+            key = sidecar_client._resolve_api_key("SIDECAR_SERVICE_API_KEY")
+
+    assert key == ""
+    assert any("SIDECAR_SERVICE_API_KEY" in record.message for record in caplog.records)
+    assert any("_Boom" in record.message or "no bound scope" in record.message for record in caplog.records)
