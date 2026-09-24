@@ -44,6 +44,52 @@ from typing import Any, Callable, Optional
 ClassifierFn = Callable[[Any], Optional[dict]]
 SIDECAR_ELIGIBLE_OPERATIONS: dict[str, ClassifierFn] = {}
 
+# STEP 4: opt-in label-based mapping. A task is eligible for operation ``<op>`` only when
+# its title is EXACTLY "sidecar:<op>" (or starts with "sidecar:<op> ") AND its body parses
+# as JSON that the operation's own registry validator accepts -- no guessing from free
+# text. Missing/wrong marker or invalid body -> None (fall through), same as every other
+# classifier here. Register only reviewed, conservative ops below.
+_LABEL_PREFIX = "sidecar:"
+
+
+def _label_classifier(operation_name: str) -> ClassifierFn:
+    """Build a classifier for ``operation_name`` gated on the ``sidecar:<op>`` title
+    marker plus the operation's own registry validator -- generic, not per-op logic."""
+
+    def _classify(task: Any) -> Optional[dict]:
+        title = str(getattr(task, "title", "") or "")
+        marker = _LABEL_PREFIX + operation_name
+        if title != marker and not title.startswith(marker + " "):
+            return None
+        body = getattr(task, "body", None)
+        if not isinstance(body, str) or not body.strip():
+            return None
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        modules = _load_sidecar_modules()
+        if modules is None:
+            return None  # can't validate -> don't route, ever
+        operation = modules["registry"].operations.get(operation_name)
+        if operation is None or not operation.validator(payload):
+            return None
+        return payload
+
+    return _classify
+
+
+# Conservative first batch (Sidecar-Adoption STEP 4): pure extraction operations with no
+# tool/permission/credential fields anywhere in their input or output schema (see each
+# module's ``_has_forbidden``/``_has_authority`` guard in the sidecars repo) -- a
+# fabricated result here can be wrong, but it cannot grant authority or silently mutate
+# anything outside the task's own result payload.
+for _op in ("json_field_extract", "code_symbol_extraction", "git_diff_summarization"):
+    SIDECAR_ELIGIBLE_OPERATIONS[_op] = _label_classifier(_op)
+del _op
+
 _SIDECAR_REPO_CACHE: dict[str, Any] = {}
 
 
