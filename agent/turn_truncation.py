@@ -44,7 +44,7 @@ _CONTEXT_OVERFLOW_PARTIAL_FINAL = (
 
 def collapse_continuation_trail(
     agent: Any, messages: List[Dict[str, Any]], current_turn_user_idx: Any, *,
-    finish_reason: str, parts: Optional[List[str]] = None,
+    finish_reason: str, parts: Optional[List[Any]] = None,
 ) -> str:
     """Drop this turn's ``_length_continuation_fragment``/``_nudge`` rows and append one
     assistant row holding the joined, think-stripped partial; returns that text ("" none).
@@ -76,8 +76,15 @@ def collapse_continuation_trail(
         return ""
     messages[turn_start:] = retained
     from agent.conversation_loop import _join_truncated_parts
+    raw = fragment_parts if parts is None else parts
+    join_parts = []
+    for item in raw:
+        if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str):
+            join_parts.append(item)
+        elif isinstance(item, str) and item:
+            join_parts.append((item, False))
     partial = agent._strip_think_blocks(
-        _join_truncated_parts(fragment_parts if parts is None else parts)
+        _join_truncated_parts(join_parts)
     ).strip()
     if partial:
         append_message(messages, {"role": "assistant", "content": partial, "finish_reason": finish_reason})
