@@ -1919,6 +1919,13 @@ DEFAULT_CONFIG = {
         # root profile named "default", so on a shared kanban.db every home can otherwise claim
         # default-assigned cards.
         "dispatch_profiles": None,
+        # Ordered, explicit quota-failover routes. Each route must include
+        # assignee/provider/model plus operator_attested: true and the
+        # authenticated/available attestation. The dispatcher still verifies
+        # profile/provider/model dispatchability at runtime; missing evidence
+        # fails closed. Review cards require the separate opt-in.
+        "provider_failover_routes": [],
+        "provider_failover_allow_review": False,
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,
