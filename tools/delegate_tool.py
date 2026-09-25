@@ -511,8 +511,14 @@ def delegate_task(
         # Sidecar-Adoption STEP 3b: opt-in pre-build interception, right after normalization
         # and before schema/image coercion and _build_children (per t_9dbf5547's spec).
         # No-op (same list object back) when kanban.sidecar_routing_enabled is off.
+        # STEP 4: pass the parent agent's session handles so fallthrough tasks get
+        # usage-tagged (see delegate_tool_sidecar_route.annotate_sidecar_routes docstring);
+        # same best-effort attr lookup pattern as agent/background_review.py's aux usage.
         from tools.delegate_tool_sidecar_route import annotate_sidecar_routes
-        task_list, _ = annotate_sidecar_routes(task_list)
+        task_list, _ = annotate_sidecar_routes(
+            task_list, session_db=getattr(parent_agent, "_session_db", None),
+            session_id=getattr(parent_agent, "session_id", None),
+        )
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if not err:
         task_images, err = _coerce_task_images(task_list, images)

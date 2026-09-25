@@ -2378,6 +2378,12 @@ def _dispatch_lane_task(
                     )
                 result.spawned.append((task_id, assignee, ""))
                 return True
+            # STEP 4: tag every fallthrough (ineligible or failed dispatch) so a later
+            # report can discover which task shapes recur often enough to justify a new
+            # sidecar operation. Best-effort, no-ops without a session id (dry_run skips
+            # writes just like the "ok" branch above).
+            if not dry_run and task_for_sidecar is not None:
+                _sidecar_route.record_fallthrough(task_for_sidecar, task_for_sidecar.session_id)
 
     # Rule 4 (no-infinite-retry): once consecutive_failures hits
     # RETRY_CAP_ESCALATION_THRESHOLD, escalate to a PO via decision-hud

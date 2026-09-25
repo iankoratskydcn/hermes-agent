@@ -55,19 +55,31 @@ class _TaskDictLike(dict):
         return self.get("context")
 
 
-def annotate_sidecar_routes(task_list: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+def annotate_sidecar_routes(
+    task_list: List[Dict[str, Any]], session_db: Any = None, session_id: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
     """Mutate a copy of each eligible task in ``task_list`` to carry a precomputed sidecar
     result entry (see ``_ROUTED_ENTRY_KEY``); ineligible/failed tasks are returned
     unchanged. Returns ``(new_task_list, routed_count)`` — same length and order as the
     input, so callers never need to renumber ``task_index``. No-op (returns the same list
-    object) when the feature flag is off, so this call costs nothing when disabled."""
+    object) when the feature flag is off, so this call costs nothing when disabled.
+
+    ``session_db``/``session_id`` (STEP 4, optional): when both are provided, every
+    fallthrough task is usage-tagged via ``kanban_sidecar_route.record_fallthrough`` so a
+    later report can discover which task shapes recur often enough to justify a new
+    sidecar operation. Best-effort; missing session context just skips tagging."""
     if not sidecar_routing_enabled():
         return task_list, 0
     new_list: List[Dict[str, Any]] = []
     routed_count = 0
     for i, task in enumerate(task_list):
-        sidecar_result = try_sidecar_route(_TaskDictLike(task)) if isinstance(task, dict) else None
+        task_like = _TaskDictLike(task) if isinstance(task, dict) else None
+        sidecar_result = try_sidecar_route(task_like) if task_like is not None else None
         if sidecar_result is None:
+            if task_like is not None and session_id:
+                from hermes_cli.kanban_sidecar_route import record_fallthrough
+
+                record_fallthrough(task_like, session_id, session_db=session_db)
             new_list.append(task)
             continue
         annotated = dict(task)
