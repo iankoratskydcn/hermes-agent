@@ -58,12 +58,39 @@ _LABEL_PREFIX = "sidecar:"
 
 
 def scholastic_context_provider(payload: dict) -> Optional[Any]:
-    """Narrow provider seam; current adapter reads ``context_pack`` from JSON.
-
-    Automatic Second Brain MCP retrieval is a deliberate TODO until this
-    dispatcher has a supported MCP client and authority boundary.
-    """
-    return payload.get(SCHOLASTIC_CONTEXT_INPUT_KEY)
+    """Return an explicit pack, or perform one bounded read-only MCP retrieval."""
+    if SCHOLASTIC_CONTEXT_INPUT_KEY in payload:
+        return payload[SCHOLASTIC_CONTEXT_INPUT_KEY]
+    try:
+        from tools import mcp_tool_discovery as discovery
+        from tools import mcp_tool_loop as mcp_loop
+        server = discovery._get_connected_server_for_call("second_brain_retrieval")
+        if server is None or getattr(server, "session", None) is None:
+            return None
+        query = " ".join([
+            payload["task_title"], payload["task_body"],
+            *payload["goals"], *payload["non_goals"],
+        ])[:2000]
+        result = mcp_loop._run_on_mcp_loop(
+            lambda: server.session.call_tool(
+                "build_brain_context",
+                arguments={"query": query, "limit": 5, "token_budget": 2000},
+            ),
+            timeout=8,
+        )
+        structured = getattr(result, "structuredContent", None)
+        if isinstance(structured, dict):
+            return structured
+        for block in getattr(result, "content", ()) or ():
+            text = getattr(block, "text", None)
+            if isinstance(text, str) and text.strip():
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        return None
+    return None
 
 
 def _bounded_context_pack(value: Any) -> Optional[Any]:
@@ -79,9 +106,8 @@ def _bounded_context_pack(value: Any) -> Optional[Any]:
 def _scholastic_context_classifier(task: Any) -> Optional[dict]:
     """Validate the narrow, dispatcher-owned Scholastic context contract.
 
-    The first working provider is deliberately the card JSON itself. Automatic
-    Second Brain MCP retrieval stays outside this dispatcher until a supported
-    client/authority seam exists; absence of that client must not block a card.
+    The explicit context pack is accepted for deterministic tests/replays; when
+    omitted, the provider performs one bounded read-only Second Brain lookup.
     """
     title = str(getattr(task, "title", "") or "")
     marker = _LABEL_PREFIX + SCHOLASTIC_CONTEXT_OPERATION
@@ -96,8 +122,8 @@ def _scholastic_context_classifier(task: Any) -> Optional[dict]:
         return None
     if not isinstance(payload, dict):
         return None
-    required = {"task_title", "task_body", "goals", "non_goals", SCHOLASTIC_CONTEXT_INPUT_KEY}
-    if set(payload) != required:
+    required = {"task_title", "task_body", "goals", "non_goals"}
+    if not required <= set(payload) or set(payload) - required - {SCHOLASTIC_CONTEXT_INPUT_KEY}:
         return None
     if not isinstance(payload["task_title"], str) or not payload["task_title"].strip():
         return None
@@ -107,9 +133,12 @@ def _scholastic_context_classifier(task: Any) -> Optional[dict]:
         return None
     if not isinstance(payload["non_goals"], list) or not payload["non_goals"] or not all(isinstance(item, str) and item.strip() for item in payload["non_goals"]):
         return None
-    if _bounded_context_pack(scholastic_context_provider(payload)) is None:
+    context_pack = scholastic_context_provider(payload)
+    if _bounded_context_pack(context_pack) is None:
         return None
-    return payload
+    enriched = dict(payload)
+    enriched[SCHOLASTIC_CONTEXT_INPUT_KEY] = context_pack
+    return enriched
 
 
 # Unlike the legacy generic mappings below, this contract is locally
