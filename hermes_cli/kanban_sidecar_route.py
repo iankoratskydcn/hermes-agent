@@ -45,7 +45,8 @@ ClassifierFn = Callable[[Any], Optional[dict]]
 SIDECAR_ELIGIBLE_OPERATIONS: dict[str, ClassifierFn] = {}
 
 SCHOLASTIC_CONTEXT_OPERATION = "second_brain_scholastic_context"
-SCHOLASTIC_CONTEXT_KEY = "context_pack"
+SCHOLASTIC_CONTEXT_INPUT_KEY = "context_pack"
+SCHOLASTIC_CONTEXT_OUTPUT_KEY = "scholastic_context"
 SCHOLASTIC_CONTEXT_MAX_CHARS = 24000
 
 # STEP 4: opt-in label-based mapping. A task is eligible for operation ``<op>`` only when
@@ -62,7 +63,7 @@ def scholastic_context_provider(payload: dict) -> Optional[Any]:
     Automatic Second Brain MCP retrieval is a deliberate TODO until this
     dispatcher has a supported MCP client and authority boundary.
     """
-    return payload.get(SCHOLASTIC_CONTEXT_KEY)
+    return payload.get(SCHOLASTIC_CONTEXT_INPUT_KEY)
 
 
 def _bounded_context_pack(value: Any) -> Optional[Any]:
@@ -94,6 +95,17 @@ def _scholastic_context_classifier(task: Any) -> Optional[dict]:
     except (json.JSONDecodeError, ValueError):
         return None
     if not isinstance(payload, dict):
+        return None
+    required = {"task_title", "task_body", "goals", "non_goals", SCHOLASTIC_CONTEXT_INPUT_KEY}
+    if set(payload) != required:
+        return None
+    if not isinstance(payload["task_title"], str) or not payload["task_title"].strip():
+        return None
+    if not isinstance(payload["task_body"], str) or not payload["task_body"].strip():
+        return None
+    if not isinstance(payload["goals"], list) or not payload["goals"] or not all(isinstance(item, str) and item.strip() for item in payload["goals"]):
+        return None
+    if not isinstance(payload["non_goals"], list) or not payload["non_goals"] or not all(isinstance(item, str) and item.strip() for item in payload["non_goals"]):
         return None
     if _bounded_context_pack(scholastic_context_provider(payload)) is None:
         return None
@@ -276,11 +288,12 @@ def scholastic_context_from_result(result: dict) -> Optional[Any]:
     if not isinstance(result, dict) or result.get("status") != "ok":
         return None
     payload = result.get("payload")
-    if isinstance(payload, dict) and SCHOLASTIC_CONTEXT_KEY in payload:
-        context_pack = payload[SCHOLASTIC_CONTEXT_KEY]
-    else:
-        context_pack = payload
-    return _bounded_context_pack(context_pack)
+    if not isinstance(payload, dict):
+        return None
+    argument = payload.get("argument_markdown")
+    if not isinstance(argument, str) or not argument.strip():
+        return None
+    return _bounded_context_pack(payload)
 
 
 def _try_remote_route(operation_name: str, input_payload: dict, sidecar_cfg: dict) -> Optional[dict]:

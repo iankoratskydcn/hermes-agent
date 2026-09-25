@@ -16,18 +16,30 @@ def _task(title: str, body: dict):
 
 
 def test_scholastic_marker_and_payload_are_validated():
-    body = {"question": "q", "context_pack": {"facts": ["one"]}}
+    body = {
+        "task_title": "Choose a bounded retrieval contract",
+        "task_body": "Define how context becomes reviewable.",
+        "goals": ["preserve provenance"],
+        "non_goals": ["grant authority"],
+        "context_pack": [{"excerpt_id": "note-1", "source": "brain", "locator": "a.md", "text": "one"}],
+    }
     assert route.classify_task_for_sidecar(
         _task("sidecar:second_brain_scholastic_context", body)
     ) == (route.SCHOLASTIC_CONTEXT_OPERATION, body)
     assert route.classify_task_for_sidecar(_task("ordinary", body)) is None
     assert route.classify_task_for_sidecar(
-        _task("sidecar:second_brain_scholastic_context", {"question": "q"})
+        _task("sidecar:second_brain_scholastic_context", {"task_title": "q"})
     ) is None
 
 
 def test_scholastic_remote_route_uses_real_card_payload(monkeypatch):
-    body = {"question": "q", "context_pack": {"facts": ["one"]}}
+    body = {
+        "task_title": "Choose a bounded retrieval contract",
+        "task_body": "Define how context becomes reviewable.",
+        "goals": ["preserve provenance"],
+        "non_goals": ["grant authority"],
+        "context_pack": [{"excerpt_id": "note-1", "source": "brain", "locator": "a.md", "text": "one"}],
+    }
     calls = []
     monkeypatch.setattr(route, "_sidecar_service_config", lambda: {"url": "http://sidecar"})
     monkeypatch.setattr(route, "_load_sidecar_modules", lambda: None)
@@ -44,7 +56,7 @@ def test_scholastic_remote_route_uses_real_card_payload(monkeypatch):
 
     def execute(envelope, cfg):
         calls.append(json.loads(envelope))
-        return {"status": "ok", "payload": {"context_pack": {"facts": ["two"]}}}
+        return {"status": "ok", "payload": {"argument_markdown": "## Quaestio\n...", "claims": [], "objections": [], "provenance": []}}
 
     monkeypatch.setattr("hermes_cli.sidecar_client.execute_remote", execute)
     result = route.try_sidecar_route(_task("sidecar:second_brain_scholastic_context", body))
@@ -61,7 +73,7 @@ def test_enrichment_replaces_context_idempotently_and_worker_sees_it(tmp_path, m
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     monkeypatch.setattr(kbd._sidecar_route, "sidecar_routing_enabled", lambda: True)
-    enriched = {"facts": ["from sidecar"], "source": "scholastic"}
+    enriched = {"argument_markdown": "## Quaestio\nfrom sidecar", "claims": [], "objections": [], "provenance": []}
     monkeypatch.setattr(
         kbd._sidecar_route,
         "try_sidecar_route",
@@ -69,7 +81,7 @@ def test_enrichment_replaces_context_idempotently_and_worker_sees_it(tmp_path, m
             "status": "ok",
             "operation": route.SCHOLASTIC_CONTEXT_OPERATION,
             "_backend": "remote",
-            "payload": {"context_pack": enriched, "objections": ["unresolved"]},
+            "payload": enriched,
         },
     )
     spawned = []
@@ -90,12 +102,11 @@ def test_enrichment_replaces_context_idempotently_and_worker_sees_it(tmp_path, m
         assert task.status == "running"
         assert spawned == [task_id]
         stored = json.loads(task.body)
-        assert stored["context_pack"] == enriched
+        assert stored["scholastic_context"] == enriched
         context = kb.build_worker_context(conn, task_id)
         assert "from sidecar" in context
-        assert "unresolved" not in context
         assert kbd._persist_scholastic_context(conn, task_id, enriched) is True
-        assert json.loads(kb.get_task(conn, task_id).body)["context_pack"] == enriched
+        assert json.loads(kb.get_task(conn, task_id).body)["scholastic_context"] == enriched
 
 
 def test_context_failure_falls_through_to_normal_spawn(tmp_path, monkeypatch, all_assignees_spawnable):
@@ -112,7 +123,13 @@ def test_context_failure_falls_through_to_normal_spawn(tmp_path, monkeypatch, al
         task_id = kb.create_task(
             conn,
             title="sidecar:second_brain_scholastic_context",
-            body=json.dumps({"context_pack": {"facts": ["one"]}}),
+            body=json.dumps({
+                "task_title": "Choose a bounded retrieval contract",
+                "task_body": "Define how context becomes reviewable.",
+                "goals": ["preserve provenance"],
+                "non_goals": ["grant authority"],
+                "context_pack": [{"excerpt_id": "note-1", "source": "brain", "locator": "a.md", "text": "one"}],
+            }),
             assignee="alice",
         )
         kbd.dispatch_once(conn, spawn_fn=lambda task, workspace, board=None: spawned.append(task.id))

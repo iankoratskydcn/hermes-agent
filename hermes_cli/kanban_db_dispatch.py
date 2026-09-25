@@ -2250,7 +2250,7 @@ def _persist_scholastic_context(
         return False
     if not isinstance(body, dict):
         return False
-    body[_sidecar_route.SCHOLASTIC_CONTEXT_KEY] = context_pack
+    body[_sidecar_route.SCHOLASTIC_CONTEXT_OUTPUT_KEY] = context_pack
     try:
         encoded = json.dumps(body, ensure_ascii=False, sort_keys=True)
     except (TypeError, ValueError):
