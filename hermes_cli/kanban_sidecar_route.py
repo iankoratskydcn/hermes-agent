@@ -80,17 +80,40 @@ def scholastic_context_provider(payload: dict) -> Optional[Any]:
         )
         structured = getattr(result, "structuredContent", None)
         if isinstance(structured, dict):
-            return structured
+            return _normalize_context_pack(structured)
         for block in getattr(result, "content", ()) or ():
             text = getattr(block, "text", None)
             if isinstance(text, str) and text.strip():
                 try:
-                    return json.loads(text)
+                    return _normalize_context_pack(json.loads(text))
                 except json.JSONDecodeError:
                     continue
     except Exception:
         return None
     return None
+
+
+def _normalize_context_pack(value: Any) -> Optional[list[dict[str, str]]]:
+    """Convert the retrieval adapter's result envelope to the sidecar contract."""
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, dict) or not isinstance(value.get("results"), list):
+        return None
+    normalized: list[dict[str, str]] = []
+    for index, item in enumerate(value["results"]):
+        if not isinstance(item, dict):
+            continue
+        locator = str(item.get("path") or item.get("source") or "").strip()
+        text = str(item.get("excerpt") or item.get("text") or "").strip()
+        if not locator or not text:
+            continue
+        normalized.append({
+            "excerpt_id": str(item.get("excerpt_id") or f"brain-{index + 1}"),
+            "source": str(item.get("source") or locator),
+            "locator": locator,
+            "text": text,
+        })
+    return normalized or None
 
 
 def _bounded_context_pack(value: Any) -> Optional[Any]:
