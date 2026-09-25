@@ -44,12 +44,129 @@ from typing import Any, Callable, Optional
 ClassifierFn = Callable[[Any], Optional[dict]]
 SIDECAR_ELIGIBLE_OPERATIONS: dict[str, ClassifierFn] = {}
 
+SCHOLASTIC_CONTEXT_OPERATION = "second_brain_scholastic_context"
+SCHOLASTIC_CONTEXT_INPUT_KEY = "context_pack"
+SCHOLASTIC_CONTEXT_OUTPUT_KEY = "scholastic_context"
+SCHOLASTIC_CONTEXT_MAX_CHARS = 24000
+
 # STEP 4: opt-in label-based mapping. A task is eligible for operation ``<op>`` only when
 # its title is EXACTLY "sidecar:<op>" (or starts with "sidecar:<op> ") AND its body parses
 # as JSON that the operation's own registry validator accepts -- no guessing from free
 # text. Missing/wrong marker or invalid body -> None (fall through), same as every other
 # classifier here. Register only reviewed, conservative ops below.
 _LABEL_PREFIX = "sidecar:"
+
+
+def scholastic_context_provider(payload: dict) -> Optional[Any]:
+    """Return an explicit pack, or perform one bounded read-only MCP retrieval."""
+    if SCHOLASTIC_CONTEXT_INPUT_KEY in payload:
+        return payload[SCHOLASTIC_CONTEXT_INPUT_KEY]
+    try:
+        from tools import mcp_tool_discovery as discovery
+        from tools import mcp_tool_loop as mcp_loop
+        server = discovery._get_connected_server_for_call("second_brain_retrieval")
+        if server is None or getattr(server, "session", None) is None:
+            return None
+        query = " ".join([
+            payload["task_title"], payload["task_body"],
+            *payload["goals"], *payload["non_goals"],
+        ])[:2000]
+        result = mcp_loop._run_on_mcp_loop(
+            lambda: server.session.call_tool(
+                "build_brain_context",
+                arguments={"query": query, "limit": 5, "token_budget": 2000},
+            ),
+            timeout=8,
+        )
+        structured = getattr(result, "structuredContent", None)
+        if isinstance(structured, dict):
+            return _normalize_context_pack(structured)
+        for block in getattr(result, "content", ()) or ():
+            text = getattr(block, "text", None)
+            if isinstance(text, str) and text.strip():
+                try:
+                    return _normalize_context_pack(json.loads(text))
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        return None
+    return None
+
+
+def _normalize_context_pack(value: Any) -> Optional[list[dict[str, str]]]:
+    """Convert the retrieval adapter's result envelope to the sidecar contract."""
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, dict) or not isinstance(value.get("results"), list):
+        return None
+    normalized: list[dict[str, str]] = []
+    for index, item in enumerate(value["results"]):
+        if not isinstance(item, dict):
+            continue
+        locator = str(item.get("path") or item.get("source") or "").strip()
+        text = str(item.get("excerpt") or item.get("text") or "").strip()
+        if not locator or not text:
+            continue
+        normalized.append({
+            "excerpt_id": str(item.get("excerpt_id") or f"brain-{index + 1}"),
+            "source": str(item.get("source") or locator),
+            "locator": locator,
+            "text": text,
+        })
+    return normalized or None
+
+
+def _bounded_context_pack(value: Any) -> Optional[Any]:
+    if not isinstance(value, (dict, list, str)) or isinstance(value, bool):
+        return None
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return None
+    return value if encoded.strip() and len(encoded) <= SCHOLASTIC_CONTEXT_MAX_CHARS else None
+
+
+def _scholastic_context_classifier(task: Any) -> Optional[dict]:
+    """Validate the narrow, dispatcher-owned Scholastic context contract.
+
+    The explicit context pack is accepted for deterministic tests/replays; when
+    omitted, the provider performs one bounded read-only Second Brain lookup.
+    """
+    title = str(getattr(task, "title", "") or "")
+    marker = _LABEL_PREFIX + SCHOLASTIC_CONTEXT_OPERATION
+    if title != marker and not title.startswith(marker + " "):
+        return None
+    body = getattr(task, "body", None)
+    if not isinstance(body, str) or not body.strip():
+        return None
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    required = {"task_title", "task_body", "goals", "non_goals"}
+    if not required <= set(payload) or set(payload) - required - {SCHOLASTIC_CONTEXT_INPUT_KEY}:
+        return None
+    if not isinstance(payload["task_title"], str) or not payload["task_title"].strip():
+        return None
+    if not isinstance(payload["task_body"], str) or not payload["task_body"].strip():
+        return None
+    if not isinstance(payload["goals"], list) or not payload["goals"] or not all(isinstance(item, str) and item.strip() for item in payload["goals"]):
+        return None
+    if not isinstance(payload["non_goals"], list) or not payload["non_goals"] or not all(isinstance(item, str) and item.strip() for item in payload["non_goals"]):
+        return None
+    context_pack = scholastic_context_provider(payload)
+    if _bounded_context_pack(context_pack) is None:
+        return None
+    enriched = dict(payload)
+    enriched[SCHOLASTIC_CONTEXT_INPUT_KEY] = context_pack
+    return enriched
+
+
+# Unlike the legacy generic mappings below, this contract is locally
+# validated so a remote sidecar can be used without importing the sidecars repo.
+SIDECAR_ELIGIBLE_OPERATIONS[SCHOLASTIC_CONTEXT_OPERATION] = _scholastic_context_classifier
 
 
 def _label_classifier(operation_name: str) -> ClassifierFn:
@@ -213,6 +330,24 @@ def try_sidecar_route(task: Any) -> Optional[dict]:
     return result
 
 
+def scholastic_context_from_result(result: dict) -> Optional[Any]:
+    """Return a bounded context pack from a successful Scholastic result.
+
+    ``objections`` are intentionally observational here. Without a real
+    Decision HUD resolution API they must not silently turn into a dispatch
+    block; the worker receives usable context and continues normally.
+    """
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return None
+    payload = result.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    argument = payload.get("argument_markdown")
+    if not isinstance(argument, str) or not argument.strip():
+        return None
+    return _bounded_context_pack(payload)
+
+
 def _try_remote_route(operation_name: str, input_payload: dict, sidecar_cfg: dict) -> Optional[dict]:
     from hermes_cli import sidecar_client
 
@@ -236,6 +371,8 @@ def _try_remote_route(operation_name: str, input_payload: dict, sidecar_cfg: dic
     if result is None:
         return None
     result["_backend"] = "remote"
+    if operation_name == SCHOLASTIC_CONTEXT_OPERATION:
+        result.setdefault("operation", operation_name)
     return result
 
 
@@ -258,4 +395,6 @@ def _try_in_process_route(operation_name: str, input_payload: dict) -> Optional[
     except Exception:
         return None
     result["_backend"] = "in_process"
+    if operation_name == SCHOLASTIC_CONTEXT_OPERATION:
+        result.setdefault("operation", operation_name)
     return result
