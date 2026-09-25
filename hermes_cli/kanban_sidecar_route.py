@@ -33,6 +33,7 @@ registry only once a shape has evidence behind it, following the pattern below.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -237,6 +238,59 @@ def _try_remote_route(operation_name: str, input_payload: dict, sidecar_cfg: dic
         return None
     result["_backend"] = "remote"
     return result
+
+
+# Sidecar-Adoption STEP 4: tag every fallthrough (never routed to the sidecar) with a
+# small, stable category so a report can discover which task shapes recur often enough to
+# justify a new eligible operation -- "what should op #100 be". Reuses the EXISTING
+# usage-tagging sink (hermes_state_usage.record_auxiliary_usage) rather than new
+# telemetry infra (ponytail rung 2). Three buckets, both real fallthrough kinds the STEP 4
+# ticket asks for:
+#   - "call_failed:<op>"     -- classifier matched (valid ``sidecar:<op>`` marker + payload)
+#                                but the sidecar dispatch itself failed/returned non-ok.
+#   - "label_mismatch:<op>"  -- task opted in with a ``sidecar:<op>`` marker but the
+#                                operation/payload didn't validate (checked, ineligible).
+#   - "unmarked"             -- task never attempted the sidecar shape at all. This is the
+#                                large majority bucket today since SIDECAR_ELIGIBLE_OPERATIONS
+#                                only matches the explicit opt-in marker (see module
+#                                docstring); it can't be split further without real semantic
+#                                classification of free-text task shapes, which is out of
+#                                scope here -- add a real classifier bucket once a report run
+#                                shows "unmarked" volume actually matters.
+_LABEL_MARKER_RE = re.compile(r"^" + re.escape(_LABEL_PREFIX) + r"([A-Za-z0-9_]+)(?:\s|$)")
+
+
+def record_fallthrough(task: Any, session_id: Optional[str], session_db: Any = None) -> None:
+    """Best-effort usage-tag for one fallthrough event (see bucket rules above). No-op
+    without a session id (CLI/dashboard-originated tasks carry none). Never raises --
+    accounting must never break dispatch. Pass ``session_db`` when the caller already
+    holds a live handle (e.g. the agent turn's aux_accounting context); otherwise this
+    acquires/releases the shared state.db registry handle itself."""
+    if not session_id:
+        return
+    try:
+        classified = classify_task_for_sidecar(task)
+        if classified is not None:
+            category = f"call_failed:{classified[0]}"
+        else:
+            title = str(getattr(task, "title", "") or "")
+            match = _LABEL_MARKER_RE.match(title)
+            category = f"label_mismatch:{match.group(1)}" if match else "unmarked"
+        owns_db = session_db is None
+        release_or_close = None
+        if owns_db:
+            from hermes_state_registry import acquire, release_or_close
+
+            session_db = acquire()
+        try:
+            session_db.record_auxiliary_usage(
+                session_id, task=f"sidecar_fallthrough:{category}", api_call_count=1,
+            )
+        finally:
+            if owns_db and release_or_close is not None:
+                release_or_close(session_db)
+    except Exception:
+        pass
 
 
 def _try_in_process_route(operation_name: str, input_payload: dict) -> Optional[dict]:
