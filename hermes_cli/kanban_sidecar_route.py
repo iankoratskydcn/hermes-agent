@@ -44,12 +44,65 @@ from typing import Any, Callable, Optional
 ClassifierFn = Callable[[Any], Optional[dict]]
 SIDECAR_ELIGIBLE_OPERATIONS: dict[str, ClassifierFn] = {}
 
+SCHOLASTIC_CONTEXT_OPERATION = "second_brain_scholastic_context"
+SCHOLASTIC_CONTEXT_KEY = "context_pack"
+SCHOLASTIC_CONTEXT_MAX_CHARS = 24000
+
 # STEP 4: opt-in label-based mapping. A task is eligible for operation ``<op>`` only when
 # its title is EXACTLY "sidecar:<op>" (or starts with "sidecar:<op> ") AND its body parses
 # as JSON that the operation's own registry validator accepts -- no guessing from free
 # text. Missing/wrong marker or invalid body -> None (fall through), same as every other
 # classifier here. Register only reviewed, conservative ops below.
 _LABEL_PREFIX = "sidecar:"
+
+
+def scholastic_context_provider(payload: dict) -> Optional[Any]:
+    """Narrow provider seam; current adapter reads ``context_pack`` from JSON.
+
+    Automatic Second Brain MCP retrieval is a deliberate TODO until this
+    dispatcher has a supported MCP client and authority boundary.
+    """
+    return payload.get(SCHOLASTIC_CONTEXT_KEY)
+
+
+def _bounded_context_pack(value: Any) -> Optional[Any]:
+    if not isinstance(value, (dict, list, str)) or isinstance(value, bool):
+        return None
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return None
+    return value if encoded.strip() and len(encoded) <= SCHOLASTIC_CONTEXT_MAX_CHARS else None
+
+
+def _scholastic_context_classifier(task: Any) -> Optional[dict]:
+    """Validate the narrow, dispatcher-owned Scholastic context contract.
+
+    The first working provider is deliberately the card JSON itself. Automatic
+    Second Brain MCP retrieval stays outside this dispatcher until a supported
+    client/authority seam exists; absence of that client must not block a card.
+    """
+    title = str(getattr(task, "title", "") or "")
+    marker = _LABEL_PREFIX + SCHOLASTIC_CONTEXT_OPERATION
+    if title != marker and not title.startswith(marker + " "):
+        return None
+    body = getattr(task, "body", None)
+    if not isinstance(body, str) or not body.strip():
+        return None
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if _bounded_context_pack(scholastic_context_provider(payload)) is None:
+        return None
+    return payload
+
+
+# Unlike the legacy generic mappings below, this contract is locally
+# validated so a remote sidecar can be used without importing the sidecars repo.
+SIDECAR_ELIGIBLE_OPERATIONS[SCHOLASTIC_CONTEXT_OPERATION] = _scholastic_context_classifier
 
 
 def _label_classifier(operation_name: str) -> ClassifierFn:
@@ -213,6 +266,23 @@ def try_sidecar_route(task: Any) -> Optional[dict]:
     return result
 
 
+def scholastic_context_from_result(result: dict) -> Optional[Any]:
+    """Return a bounded context pack from a successful Scholastic result.
+
+    ``objections`` are intentionally observational here. Without a real
+    Decision HUD resolution API they must not silently turn into a dispatch
+    block; the worker receives usable context and continues normally.
+    """
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return None
+    payload = result.get("payload")
+    if isinstance(payload, dict) and SCHOLASTIC_CONTEXT_KEY in payload:
+        context_pack = payload[SCHOLASTIC_CONTEXT_KEY]
+    else:
+        context_pack = payload
+    return _bounded_context_pack(context_pack)
+
+
 def _try_remote_route(operation_name: str, input_payload: dict, sidecar_cfg: dict) -> Optional[dict]:
     from hermes_cli import sidecar_client
 
@@ -236,6 +306,8 @@ def _try_remote_route(operation_name: str, input_payload: dict, sidecar_cfg: dic
     if result is None:
         return None
     result["_backend"] = "remote"
+    if operation_name == SCHOLASTIC_CONTEXT_OPERATION:
+        result.setdefault("operation", operation_name)
     return result
 
 
@@ -258,4 +330,6 @@ def _try_in_process_route(operation_name: str, input_payload: dict) -> Optional[
     except Exception:
         return None
     result["_backend"] = "in_process"
+    if operation_name == SCHOLASTIC_CONTEXT_OPERATION:
+        result.setdefault("operation", operation_name)
     return result

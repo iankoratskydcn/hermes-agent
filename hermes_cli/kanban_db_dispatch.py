@@ -2232,6 +2232,33 @@ def _projected_workspace(
     return handle.path
 
 
+def _persist_scholastic_context(
+    conn: sqlite3.Connection, task_id: str, context_pack: Any,
+) -> bool:
+    """Replace the reserved context field in the card body, once per run.
+
+    The worker already reads task bodies through ``build_worker_context``;
+    persisting one JSON field avoids a second prompt seam and makes retries
+    deterministic. Non-JSON bodies fail closed to normal spawning.
+    """
+    row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or not isinstance(row["body"], str):
+        return False
+    try:
+        body = json.loads(row["body"])
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(body, dict):
+        return False
+    body[_sidecar_route.SCHOLASTIC_CONTEXT_KEY] = context_pack
+    try:
+        encoded = json.dumps(body, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return False
+    conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (encoded, task_id))
+    return True
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2363,21 +2390,42 @@ def _dispatch_lane_task(
                 if secret_token is not None:
                     reset_secret_scope(secret_token)
             if sidecar_result is not None:
-                if not dry_run:
-                    with _kb.write_txn(conn):
-                        _kb._append_event(
-                            conn, task_id, "sidecar_routed",
-                            {"operation": sidecar_result.get("operation"),
-                             "backend": sidecar_result.get("_backend")},
+                context_enriched = False
+                if sidecar_result.get("operation") == _sidecar_route.SCHOLASTIC_CONTEXT_OPERATION:
+                    context_pack = _sidecar_route.scholastic_context_from_result(sidecar_result)
+                    if context_pack is None:
+                        sidecar_result = None
+                    elif not dry_run:
+                        with _kb.write_txn(conn):
+                            if not _persist_scholastic_context(conn, task_id, context_pack):
+                                sidecar_result = None
+                            else:
+                                _kb._append_event(
+                                    conn, task_id, "sidecar_context_enriched",
+                                    {"backend": sidecar_result.get("_backend"),
+                                     "operation": sidecar_result.get("operation")},
+                                )
+                        context_enriched = sidecar_result is not None
+                    else:
+                        # Dry runs do not mutate the body but still preserve
+                        # the ordinary spawn accounting below.
+                        context_enriched = True
+                if sidecar_result is not None and not context_enriched:
+                    if not dry_run:
+                        with _kb.write_txn(conn):
+                            _kb._append_event(
+                                conn, task_id, "sidecar_routed",
+                                {"operation": sidecar_result.get("operation"),
+                                 "backend": sidecar_result.get("_backend")},
+                            )
+                        _kb.complete_task(
+                            conn, task_id,
+                            result=json.dumps(sidecar_result.get("payload")),
+                            summary=f"Auto-routed to sidecar_service operation {sidecar_result.get('operation')!r}.",
+                            metadata={"sidecar_result": sidecar_result},
                         )
-                    _kb.complete_task(
-                        conn, task_id,
-                        result=json.dumps(sidecar_result.get("payload")),
-                        summary=f"Auto-routed to sidecar_service operation {sidecar_result.get('operation')!r}.",
-                        metadata={"sidecar_result": sidecar_result},
-                    )
-                result.spawned.append((task_id, assignee, ""))
-                return True
+                    result.spawned.append((task_id, assignee, ""))
+                    return True
 
     # Rule 4 (no-infinite-retry): once consecutive_failures hits
     # RETRY_CAP_ESCALATION_THRESHOLD, escalate to a PO via decision-hud
