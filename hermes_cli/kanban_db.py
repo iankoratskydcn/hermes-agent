@@ -3013,6 +3013,28 @@ def _claim_is_live(trow) -> bool:
     )
 
 
+def _verify_worktree_handoff(
+    conn: sqlite3.Connection, task_id: str, *, event_kind: str,
+) -> tuple[bool, Optional[str]]:
+    """Reject terminal handoffs from detached, dirty, or unregistered worktrees."""
+    task = get_task(conn, task_id)
+    if task is None:
+        return True, None
+    from hermes_cli.kanban_worktree_guard import verify_task_worktree
+
+    checked = verify_task_worktree(task)
+    if checked.ok:
+        return True, None
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            event_kind,
+            {"reason": checked.reason, "workspace_path": task.workspace_path},
+        )
+    return False, checked.reason
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -3037,6 +3059,11 @@ def complete_task(
     auditable event. Approving a card out of ``review`` stays exempt.
     """
     now = int(time.time())
+    worktree_ok, _worktree_reason = _verify_worktree_handoff(
+        conn, task_id, event_kind="completion_blocked_worktree",
+    )
+    if not worktree_ok:
+        return False
     # Isolation ingest is a mandatory pre-completion gate. It quarantines on
     # malformed/missing scope or unauthorized diff; callers cannot opt out.
     from hermes_cli.kanban_ingest import run_ingest_pipeline
@@ -3673,6 +3700,11 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    worktree_ok, worktree_reason = _verify_worktree_handoff(
+        conn, task_id, event_kind="review_blocked_worktree",
+    )
+    if not worktree_ok:
+        return _ret(False, worktree_reason)
     # Declared (metadata["artifacts"]) and prose-referenced files
     # must be durable BEFORE anything can clean the scratch workspace up: for a
     # review-bound card the reviewer's completion is the cleanup trigger.
