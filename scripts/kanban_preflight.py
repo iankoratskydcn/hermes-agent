@@ -119,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
     if args.self_test:
-        root = Path("/tmp/repo")
+        root = Path.cwd() / "repo"
         result = validate_execution_envelope({
             "project_id": "p", "repo_path": str(root), "workspace_kind": "worktree",
             "workspace_path": str(root), "branch_name": "b", "assignee": "a", "reviewer": "r",
