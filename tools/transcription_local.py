@@ -206,7 +206,9 @@ def build_local_transcribe_kwargs(stt_config: Optional[Dict[str, Any]] = None) -
     # ``vad: null`` in YAML means "default on".
     vad_enabled = local_cfg.get("vad", True)
     kwargs: Dict[str, Any] = {
-        "beam_size": 5,
+        # Beam 1 is materially faster on CPU; retain the historical default of 5 and let
+        # speed-sensitive profiles opt into the quality/latency tradeoff explicitly.
+        "beam_size": max(1, _config_number(local_cfg, "beam_size", 5, int)),
         "condition_on_previous_text": False,
         "vad_filter": vad_enabled is None or bool(vad_enabled)}
     if kwargs["vad_filter"]:

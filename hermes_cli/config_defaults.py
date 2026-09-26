@@ -1062,6 +1062,9 @@ DEFAULT_CONFIG = {
             # Shortest first sentence (chars) spoken on its own by streaming TTS; shorter openers
             # ride with the next sentence. 20 suits English; CJK voice setups use ~6.
             "min_len": 20,
+            # Number of sentences synthesized ahead of playback for non-streaming providers.
+            # Increase slightly to hide provider jitter; the queue remains bounded.
+            "lookahead": 2,
         },
         "edge": {
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
@@ -1153,6 +1156,8 @@ DEFAULT_CONFIG = {
             # ABOVE no_speech_prob_threshold AND avg_logprob BELOW logprob_threshold.
             "vad": True,
             "vad_min_silence_ms": 500,  # min silence (ms) that splits speech chunks
+            # faster-whisper beam width: 1 minimizes latency; 5 preserves the historical default.
+            "beam_size": 5,
             "no_speech_prob_threshold": 0.6,
             "logprob_threshold": -1.0,
             "unload_after_idle_seconds": 0,  # 0 = never; e.g. 300 frees the model after 5min

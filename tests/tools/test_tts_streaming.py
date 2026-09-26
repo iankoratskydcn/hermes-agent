@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import tools.tts_streaming as ts
+from tools.tts_tool_speaker import resolve_tts_lookahead
 
 pytest.importorskip("numpy")
 
@@ -88,6 +89,12 @@ def test_never_swaps_provider_for_streaming(monkeypatch):
     # (non-streaming) provider — that would silently change their voice.
     _register_fake(monkeypatch, "elevenlabs")
     assert ts.resolve_streaming_provider({"provider": "edge"}) is None
+
+
+def test_tts_lookahead_is_configurable_for_network_jitter():
+    assert resolve_tts_lookahead({"streaming": {"lookahead": 4}}) == 4
+    assert resolve_tts_lookahead({"streaming": {"lookahead": 0}}) == 1
+    assert resolve_tts_lookahead({"streaming": {"lookahead": "bad"}}) == 2
 
 
 # ── Built-in provider availability ───────────────────────────────────────

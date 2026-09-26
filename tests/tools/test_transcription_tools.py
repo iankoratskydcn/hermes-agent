@@ -516,6 +516,26 @@ class TestTranscribeLocalExtended:
             "base", local_files_only=True, device="cpu", compute_type="float32"
         )
 
+    def test_configured_beam_size_is_forwarded_to_transcribe(self, tmp_path):
+        """The local STT speed/quality tradeoff is configurable at the public seam."""
+        audio = tmp_path / "test.ogg"
+        audio.write_bytes(b"fake")
+
+        mock_segment = MagicMock(text="hi", no_speech_prob=0.0, avg_logprob=0.0)
+        mock_model = MagicMock()
+        mock_model.transcribe.return_value = ([mock_segment], MagicMock(language="en", duration=1.0))
+        fake_config = {"local": {"beam_size": 1, "device": "cpu", "compute_type": "int8"}}
+
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value=fake_config), \
+             patch("tools.transcription_tools._local_model", mock_model), \
+             patch("tools.transcription_tools._local_model_name", "base"):
+            from tools.transcription_tools import _transcribe_local
+            result = _transcribe_local(str(audio), "base")
+
+        assert result["success"] is True
+        assert mock_model.transcribe.call_args.kwargs["beam_size"] == 1
+
 
     def test_cuda_out_of_memory_does_not_trigger_cpu_fallback(self, tmp_path):
         """'CUDA out of memory' is a real error, not a missing lib — surface it."""

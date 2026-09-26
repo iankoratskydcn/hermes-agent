@@ -154,6 +154,14 @@ class _SyncSentencePipeline:
                 _unlink_quietly(tmp_path)
 
 
+def resolve_tts_lookahead(tts_config: dict) -> int:
+    """Resolve bounded sentence lookahead for non-streaming TTS providers."""
+    try:
+        return max(1, int((tts_config.get("streaming") or {}).get("lookahead", 2)))
+    except (AttributeError, TypeError, ValueError):
+        return 2
+
+
 class _StreamerPlayback:
     """Prefetch + FIFO playback for a chunked :class:`StreamingTTSProvider`.
 
@@ -349,7 +357,8 @@ def stream_tts_to_speaker(
         streamer = resolve_streaming_provider(tts_config, preferred=provider)
         stream_max_len = 0
         if streamer is None:
-            sync_pipeline = _SyncSentencePipeline(stop_event)
+            sync_pipeline = _SyncSentencePipeline(
+                stop_event, lookahead=resolve_tts_lookahead(tts_config))
         else:
             with contextlib.suppress(Exception):
                 stream_max_len = origin._resolve_max_text_length(
