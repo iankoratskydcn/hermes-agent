@@ -160,40 +160,77 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
         _log.debug("kanban lifecycle hook %s failed: %s", event, exc)
 
 
-_DEFERRED_LIFECYCLE_HOOKS: dict[int, list[list[tuple[str, str, dict[str, Any]]]]] = {}
+@dataclass
+class _DeferredLifecycleState:
+    """Connection-owned deferred hook frames, with identity protection for id reuse."""
+
+    conn: Any
+    frames: list[list[tuple[str, str, dict[str, Any]]]]
+
+
+_DEFERRED_LIFECYCLE_HOOKS: dict[int, _DeferredLifecycleState] = {}
+
+
+def _deferred_lifecycle_state(conn: Any, *, create: bool = False) -> Optional[_DeferredLifecycleState]:
+    key = id(conn)
+    state = _DEFERRED_LIFECYCLE_HOOKS.get(key)
+    if state is not None and state.conn is not conn:
+        # Keep the old connection strongly referenced until its state is removed;
+        # never attach stale frames to a newly allocated connection with a reused id.
+        _DEFERRED_LIFECYCLE_HOOKS.pop(key, None)
+        state = None
+    if state is None and create:
+        state = _DeferredLifecycleState(conn=conn, frames=[[]])
+        _DEFERRED_LIFECYCLE_HOOKS[key] = state
+    return state
 
 
 def _defer_lifecycle_hook(conn: Any, event: str, task_id: str, **fields: Any) -> None:
     """Queue a hook until the connection's outermost write transaction commits."""
-    frames = _DEFERRED_LIFECYCLE_HOOKS.setdefault(id(conn), [[]])
-    frames[-1].append((event, task_id, fields))
+    state = _deferred_lifecycle_state(conn, create=True)
+    assert state is not None
+    state.frames[-1].append((event, task_id, fields))
 
 
 def _begin_deferred_lifecycle_frame(conn: Any) -> None:
-    _DEFERRED_LIFECYCLE_HOOKS.setdefault(id(conn), []).append([])
+    state = _deferred_lifecycle_state(conn)
+    if state is None:
+        state = _deferred_lifecycle_state(conn, create=True)
+        assert state is not None
+        return
+    state.frames.append([])
 
 
 def _merge_deferred_lifecycle_frame(conn: Any) -> None:
-    frames = _DEFERRED_LIFECYCLE_HOOKS.get(id(conn), [])
-    if len(frames) > 1:
-        frames[-2].extend(frames.pop())
+    state = _deferred_lifecycle_state(conn)
+    if state is not None and len(state.frames) > 1:
+        state.frames[-2].extend(state.frames.pop())
 
 
 def _discard_deferred_lifecycle_frame(conn: Any) -> None:
-    frames = _DEFERRED_LIFECYCLE_HOOKS.get(id(conn), [])
-    if len(frames) > 1:
-        frames.pop()
+    state = _deferred_lifecycle_state(conn)
+    if state is not None and len(state.frames) > 1:
+        state.frames.pop()
 
 
 def _discard_deferred_lifecycle_hooks(conn: Any) -> None:
-    _DEFERRED_LIFECYCLE_HOOKS.pop(id(conn), None)
+    state = _deferred_lifecycle_state(conn)
+    if state is not None:
+        _DEFERRED_LIFECYCLE_HOOKS.pop(id(conn), None)
 
 
 def _flush_deferred_lifecycle_hooks(conn: Any) -> None:
-    frames = _DEFERRED_LIFECYCLE_HOOKS.pop(id(conn), [])
-    hooks = frames[0] if frames else []
+    state = _deferred_lifecycle_state(conn)
+    if state is None:
+        return
+    _DEFERRED_LIFECYCLE_HOOKS.pop(id(conn), None)
+    hooks = state.frames[0] if state.frames else []
     for event, task_id, fields in hooks:
         _fire_kanban_lifecycle_hook(event, task_id, **fields)
+
+
+def _has_deferred_lifecycle_state(conn: Any) -> bool:
+    return _deferred_lifecycle_state(conn) is not None
 
 
 def _fire_task_hook(event: str, task: Optional["Task"], task_id: str, run_id: Optional[int], **fields: Any) -> None:
@@ -1739,7 +1776,7 @@ def create_task(
                 "board": board or get_current_board(), "assignee": assignee, "run_id": None,
                 "project_id": project_id, "workspace_kind": workspace_kind,
             }
-            if id(conn) in _DEFERRED_LIFECYCLE_HOOKS:
+            if _has_deferred_lifecycle_state(conn):
                 _defer_lifecycle_hook(conn, "on_kanban_task_created", task_id, **hook_fields)
             else:
                 _fire_kanban_lifecycle_hook("on_kanban_task_created", task_id, **hook_fields)

@@ -46,6 +46,22 @@ _INIT_LOCK_TIMEOUT_SECONDS = 10.0
 _INIT_LOCK_POLL_SECONDS = 0.05
 
 
+class _KanbanConnection(sqlite3.Connection):
+    """Connection that closes the lifecycle-hook gap for caller-managed commits."""
+
+    def commit(self) -> None:
+        super().commit()
+        _kb._flush_deferred_lifecycle_hooks(self)
+
+    def rollback(self) -> None:
+        super().rollback()
+        _kb._discard_deferred_lifecycle_hooks(self)
+
+    def close(self) -> None:
+        _kb._discard_deferred_lifecycle_hooks(self)
+        super().close()
+
+
 def _resolve_busy_timeout_ms() -> int:
     """Return the SQLite busy timeout for Kanban connections. Kanban is the
     shared cross-profile dispatch bus, so worker stampedes are expected; a
@@ -64,6 +80,7 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     conn = connect_tracked(
         path,
         connect_fn=sqlite3.connect,
+        factory=_KanbanConnection,
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
     )
