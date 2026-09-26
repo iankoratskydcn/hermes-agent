@@ -160,6 +160,42 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
         _log.debug("kanban lifecycle hook %s failed: %s", event, exc)
 
 
+_DEFERRED_LIFECYCLE_HOOKS: dict[int, list[list[tuple[str, str, dict[str, Any]]]]] = {}
+
+
+def _defer_lifecycle_hook(conn: Any, event: str, task_id: str, **fields: Any) -> None:
+    """Queue a hook until the connection's outermost write transaction commits."""
+    frames = _DEFERRED_LIFECYCLE_HOOKS.setdefault(id(conn), [[]])
+    frames[-1].append((event, task_id, fields))
+
+
+def _begin_deferred_lifecycle_frame(conn: Any) -> None:
+    _DEFERRED_LIFECYCLE_HOOKS.setdefault(id(conn), []).append([])
+
+
+def _merge_deferred_lifecycle_frame(conn: Any) -> None:
+    frames = _DEFERRED_LIFECYCLE_HOOKS.get(id(conn), [])
+    if len(frames) > 1:
+        frames[-2].extend(frames.pop())
+
+
+def _discard_deferred_lifecycle_frame(conn: Any) -> None:
+    frames = _DEFERRED_LIFECYCLE_HOOKS.get(id(conn), [])
+    if len(frames) > 1:
+        frames.pop()
+
+
+def _discard_deferred_lifecycle_hooks(conn: Any) -> None:
+    _DEFERRED_LIFECYCLE_HOOKS.pop(id(conn), None)
+
+
+def _flush_deferred_lifecycle_hooks(conn: Any) -> None:
+    frames = _DEFERRED_LIFECYCLE_HOOKS.pop(id(conn), [])
+    hooks = frames[0] if frames else []
+    for event, task_id, fields in hooks:
+        _fire_kanban_lifecycle_hook(event, task_id, **fields)
+
+
 def _fire_task_hook(event: str, task: Optional["Task"], task_id: str, run_id: Optional[int], **fields: Any) -> None:
     """Lifecycle hook for a task transition; ``assignee`` from the (possibly missing) row."""
     _fire_kanban_lifecycle_hook(
@@ -927,6 +963,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "ears_sentence", "task_mode", "role", "card_class", "obligations", "feedback_schema",
+    "session_id",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -1698,11 +1735,14 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
-            _fire_kanban_lifecycle_hook(
-                "on_kanban_task_created", task_id,
-                board=board or get_current_board(), assignee=assignee, run_id=None,
-                project_id=project_id, workspace_kind=workspace_kind,
-            )
+            hook_fields = {
+                "board": board or get_current_board(), "assignee": assignee, "run_id": None,
+                "project_id": project_id, "workspace_kind": workspace_kind,
+            }
+            if getattr(conn, "in_transaction", False):
+                _defer_lifecycle_hook(conn, "on_kanban_task_created", task_id, **hook_fields)
+            else:
+                _fire_kanban_lifecycle_hook("on_kanban_task_created", task_id, **hook_fields)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

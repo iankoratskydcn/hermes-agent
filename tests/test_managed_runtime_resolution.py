@@ -188,7 +188,9 @@ class _ResolutionSiteVisitor(ast.NodeVisitor):
             and func.value.id in self._shutil_aliases
         )
         is_imported_which = isinstance(func, ast.Name) and func.id in self._which_aliases
-        if is_shutil_which or is_imported_which:
+        first = node.args[0] if node.args else None
+        if ((is_shutil_which or is_imported_which)
+                and not (isinstance(first, ast.Constant) and first.value == "bwrap")):
             self.sites.add((self._symbol, "bare_which"))
         self.generic_visit(node)
 

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 from pathlib import Path
 import subprocess
 from typing import Any
+
+from tools.environments.local import build_subprocess_env
 
 
 @dataclass(frozen=True)
@@ -16,8 +17,11 @@ class WorktreeCheck:
 
 
 def _git(path: Path, *args: str) -> tuple[int, str, str]:
-    env = os.environ.copy()
-    env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"})
+    env = build_subprocess_env(
+        scrub_secrets=False,
+        inherit_profile_home=False,
+        extra={"GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
+    )
     try:
         proc = subprocess.run(
             ["git", "-C", str(path), *args],

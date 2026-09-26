@@ -1259,6 +1259,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
                 "the outer transaction commits)."
             )
         savepoint = f"hermes_nested_{secrets.token_hex(8)}"
+        _kb._begin_deferred_lifecycle_frame(conn)
         conn.execute(f"SAVEPOINT {savepoint}")
         try:
             yield conn
@@ -1266,12 +1267,15 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute(f"ROLLBACK TO {savepoint}")
                 conn.execute(f"RELEASE {savepoint}")
+            _kb._discard_deferred_lifecycle_frame(conn)
             raise
         else:
             conn.execute(f"RELEASE {savepoint}")
+            _kb._merge_deferred_lifecycle_frame(conn)
         return
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    _kb._begin_deferred_lifecycle_frame(conn)
     try:
         yield conn
     except Exception:
@@ -1279,6 +1283,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         # don't let this secondary failure shadow the real one.
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute("ROLLBACK")
+        _kb._discard_deferred_lifecycle_hooks(conn)
         raise
     else:
         try:
@@ -1288,9 +1293,11 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             # connection isn't poisoned for the next BEGIN IMMEDIATE.
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute("ROLLBACK")
+            _kb._discard_deferred_lifecycle_hooks(conn)
             raise
         # Post-commit torn-extend check — raise now rather than silently corrupt.
         _check_file_length_invariant(conn)
+        _kb._flush_deferred_lifecycle_hooks(conn)
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
