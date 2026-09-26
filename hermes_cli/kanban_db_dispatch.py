@@ -152,6 +152,8 @@ class DispatchResult:
     ``kanban.gate_precheck_enabled`` is set in ``config.yaml``. Distinct from
     ``respawn_guarded`` (a different, always-on mechanism) so telemetry can
     tell them apart."""
+    skipped_execution_envelope: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks refused by the opt-in fail-closed execution-envelope gate."""
     provider_budget_blocked: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` refused because the assignee's provider account
     (``kanban.provider_budgets``, see ``kanban_provider_budget.py``) is over
@@ -2295,6 +2297,29 @@ def _dispatch_lane_task(
                 result.skipped_gate_precheck.append((task_id, precheck["reason"]))
                 return False
 
+    if execution_envelope_enabled():
+        task_for_envelope = _kb.get_task(conn, task_id)
+        if task_for_envelope is not None:
+            from hermes_cli.kanban_execution_envelope import envelope_from_task, validate_execution_envelope
+            envelope = envelope_from_task(task_for_envelope)
+            if lane == "review":
+                review_event = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
+                    "ORDER BY id DESC LIMIT 1", (task_id,),
+                ).fetchone()
+                payload = _kb._json_dict(review_event["payload"]) if review_event else {}
+                envelope["assignee"] = payload.get("implementer")
+                envelope["reviewer"] = task_for_envelope.assignee
+            checked = validate_execution_envelope(envelope)
+            if not checked.ok:
+                result.skipped_execution_envelope.append((task_id, "; ".join(checked.errors)))
+                if not dry_run:
+                    with _kb.write_txn(conn):
+                        _kb._append_event(conn, task_id, "execution_envelope_blocked", {
+                            "errors": checked.errors, "correction": checked.correction,
+                        })
+                return False
+
     # Rolling-window provider-quota guard (kanban.provider_budgets): pools
     # rate-limited exits across every profile sharing one provider account so
     # a fan-out can't hammer the same 429 wall from N independent per-task
@@ -2378,6 +2403,12 @@ def _dispatch_lane_task(
                     )
                 result.spawned.append((task_id, assignee, ""))
                 return True
+            # STEP 4: tag every fallthrough (ineligible or failed dispatch) so a later
+            # report can discover which task shapes recur often enough to justify a new
+            # sidecar operation. Best-effort, no-ops without a session id (dry_run skips
+            # writes just like the "ok" branch above).
+            if not dry_run and task_for_sidecar is not None:
+                _sidecar_route.record_fallthrough(task_for_sidecar, task_for_sidecar.session_id)
 
     # Rule 4 (no-infinite-retry): once consecutive_failures hits
     # RETRY_CAP_ESCALATION_THRESHOLD, escalate to a PO via decision-hud
@@ -2879,8 +2910,17 @@ def _dispatch_once_locked(
 
     ready_rows = _lane_rows(conn, "ready")
     # Review rows are enumerated up front so the budget split can see whether
-    # review work exists at all.
-    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    # review work exists at all. Gate on both profile config AND board metadata,
+    # fail-closed: board metadata `review_dispatch_enabled=false` stops all review
+    # spawns regardless of profile config.
+    board_review_dispatch_enabled = _kb.read_board_metadata(board=board).get(
+        "review_dispatch_enabled", True
+    )
+    review_rows = (
+        _lane_rows(conn, "review")
+        if review_dispatch_enabled() and board_review_dispatch_enabled
+        else []
+    )
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
     # Resolved BEFORE the review reservation so the reservation can see which
@@ -2975,6 +3015,17 @@ def gate_precheck_enabled(kanban_cfg: Optional[dict] = None) -> bool:
     if not isinstance(kanban_cfg, dict):
         kanban_cfg = {}
     return bool(kanban_cfg.get("gate_precheck_enabled", False))
+
+
+def execution_envelope_enabled(kanban_cfg: Optional[dict] = None) -> bool:
+    """Whether strict project/worktree/owner/proof metadata gates dispatch."""
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config
+            kanban_cfg = load_config().get("kanban") or {}
+        except Exception:
+            kanban_cfg = {}
+    return isinstance(kanban_cfg, dict) and bool(kanban_cfg.get("execution_envelope_enabled", False))
 
 
 def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, int]:

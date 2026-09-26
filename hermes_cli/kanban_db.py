@@ -1533,6 +1533,33 @@ def create_task(
     skills_list = _normalize_task_skills(skills)
     scope_paths_list = list(scope_paths) if scope_paths is not None else None
     obligations_list = list(obligations) if obligations is not None else None
+    scope_manifest = scope_manifest if isinstance(scope_manifest, dict) else None
+    try:
+        from hermes_cli.config import load_config
+        envelope_enabled = bool((load_config().get("kanban") or {}).get(
+            "execution_envelope_enabled", False
+        ))
+    except Exception:
+        envelope_enabled = False
+    if envelope_enabled:
+        from hermes_cli.kanban_execution_envelope import validate_execution_envelope
+        envelope = {
+            "project_id": project_id,
+            "repo_path": project_repo or (scope_manifest or {}).get("repo_path"),
+            "workspace_kind": workspace_kind,
+            "workspace_path": workspace_path,
+            "branch_name": branch_name,
+            "assignee": assignee,
+            "reviewer": (scope_manifest or {}).get("reviewer"),
+            "skills": skills_list,
+            "dependencies": (scope_manifest or {}).get("dependencies"),
+            "proof_command": (scope_manifest or {}).get("proof_command"),
+            "stop_condition": (scope_manifest or {}).get("stop_condition"),
+            "idempotency_key": idempotency_key,
+        }
+        checked = validate_execution_envelope(envelope)
+        if not checked.ok:
+            raise ValueError("execution envelope invalid: " + "; ".join(checked.errors))
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1544,6 +1571,30 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
+    if envelope_enabled and scope_manifest and scope_manifest.get("source_fingerprint"):
+        from hermes_cli.kanban_execution_envelope import normalized_fingerprint
+        candidate = normalized_fingerprint({
+            "project_id": project_id,
+            "outcome": scope_manifest.get("outcome") or title,
+            "source_fingerprint": scope_manifest.get("source_fingerprint"),
+        })
+        active_rows = conn.execute(
+            "SELECT id, project_id, title, scope_manifest FROM tasks "
+            "WHERE project_id = ? AND status NOT IN ('done', 'archived')",
+            (project_id,),
+        ).fetchall()
+        for active in active_rows:
+            existing_manifest = _json_dict(active["scope_manifest"])
+            existing = normalized_fingerprint({
+                "project_id": active["project_id"],
+                "outcome": existing_manifest.get("outcome") or active["title"],
+                "source_fingerprint": existing_manifest.get("source_fingerprint"),
+            })
+            if existing == candidate:
+                raise ValueError(
+                    f"duplicate active outcome fingerprint; existing task {active['id']!r} "
+                    "must be completed, archived, or given a distinct source_fingerprint"
+                )
 
     now = int(time.time())
 
@@ -3658,6 +3709,24 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
             reviewer = _canonical_assignee(reviewer)
+            try:
+                from hermes_cli.config import load_config
+                envelope_enabled = bool((load_config().get("kanban") or {}).get(
+                    "execution_envelope_enabled", False
+                ))
+            except Exception:
+                envelope_enabled = False
+            if envelope_enabled:
+                from hermes_cli.kanban_execution_envelope import envelope_from_task, validate_execution_envelope
+                envelope_task = get_task(conn, task_id)
+                checked = validate_execution_envelope(
+                    envelope_from_task(envelope_task, reviewer=reviewer)
+                ) if envelope_task is not None else None
+                if checked is None or not checked.ok:
+                    reason = "execution envelope invalid"
+                    if checked is not None:
+                        reason += ": " + "; ".join(checked.errors)
+                    return _ret(False, reason)
             # The actor is the run that did the work. ``assignee`` is the actor
             # only while a worker holds the card; on a never-claimed card it is
             # whoever the operator assigned -- possibly the reviewer itself,
