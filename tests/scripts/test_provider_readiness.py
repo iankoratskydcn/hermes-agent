@@ -18,6 +18,9 @@ spec.loader.exec_module(provider_readiness)
 
 
 class ProviderReadinessTests(unittest.TestCase):
+    def test_self_test_cli_does_not_require_board_access(self) -> None:
+        self.assertEqual(provider_readiness.main(["--self-test"]), 0)
+
     def test_http_401_with_missing_profile_auth_is_actionable_without_secret(self) -> None:
         diagnosis, remediation = provider_readiness.classify_failure(
             "HTTP 401 Unauthorized: invalid API key",

@@ -206,13 +206,36 @@ def run(task_ids: list[str], *, apply: bool = False, pins: dict[str, tuple[str, 
                 "dispatch_dry_run": dispatch}
 
 
+def self_test() -> None:
+    cases = (
+        ("HTTP 401 Unauthorized: invalid API key", "missing_auth"),
+        ("HTTP 429 rate limit exceeded", "rate_limit_quota"),
+        ("404 model not found", "stale_card_pin"),
+    )
+    for error, expected in cases:
+        diagnosis, remediation = classify_failure(
+            error,
+            auth_ok=False if expected == "missing_auth" else None,
+            has_pin=expected == "stale_card_pin",
+        )
+        assert diagnosis == expected
+        assert remediation
+    print("self-test passed")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("task_ids", nargs="+", help="bounded explicit Kanban task IDs")
+    parser.add_argument("task_ids", nargs="*", help="bounded explicit Kanban task IDs")
+    parser.add_argument("--self-test", action="store_true", help="run local classifier checks without reading the board")
     parser.add_argument("--apply", action="store_true", help="apply owner-approved recovery; default is report only")
     parser.add_argument("--pin", nargs=3, action="append", metavar=("TASK_ID", "MODEL", "PROVIDER"),
                         help="owner-approved pin; use '-' provider to clear provider override")
     args = parser.parse_args(argv)
+    if args.self_test:
+        self_test()
+        return 0
+    if not args.task_ids:
+        parser.error("at least one task_id is required unless --self-test is used")
     pins = {task: (model, None if provider == "-" else provider) for task, model, provider in (args.pin or [])}
     try:
         result = run(args.task_ids, apply=args.apply, pins=pins)
