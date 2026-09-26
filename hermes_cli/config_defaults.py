@@ -1950,6 +1950,9 @@ DEFAULT_CONFIG = {
         # unproven heuristic with a materially different risk profile than other
         # dispatch guards, so it stays fully opt-in until an operator turns it on.
         "gate_precheck_enabled": False,
+        # Strict project/worktree/owner/proof envelope gate. Disabled by default
+        # for legacy cards; boards adopting the policy must opt in explicitly.
+        "execution_envelope_enabled": False,
         # Sidecar-Adoption STEP 3a: opt-in dispatch-time sidecar auto-routing
         # (hermes_cli/kanban_sidecar_route.py). False (default) = always spawn normally;
         # an operator must explicitly enable this, same as gate_precheck_enabled above.
