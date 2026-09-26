@@ -125,7 +125,7 @@ def run_harness(task_id: str, snapshot_path: str, obligations: list[str], *,
         runner = executor or _default_executor
         try:
             runner(snapshot_path, report_path, image=image or os.environ.get("HERMES_CONTRACT_TEST_IMAGE", "python:3.12-slim"), timeout=timeout)
-            report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+            report = json.loads(Path(report_path).read_text(encoding="utf-8-sig"))
         except HarnessError:
             raise
         except Exception as exc:

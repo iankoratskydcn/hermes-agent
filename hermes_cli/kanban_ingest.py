@@ -99,7 +99,7 @@ def _diff_projected(workspace: Path) -> tuple[bool, tuple[str, ...], str]:
     """
     manifest_path = workspace.parent / f".{workspace.name}.projection-manifest.json"
     try:
-        baseline: dict[str, str] = json.loads(manifest_path.read_text(encoding="utf-8"))
+        baseline: dict[str, str] = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return False, (), "projected workspace has no readable baseline manifest"
     current: dict[str, str] = {}

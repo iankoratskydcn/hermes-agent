@@ -2200,7 +2200,7 @@ def _projected_workspace(
     if not repo_value:
         implicit_repo = True
         try:
-            repo_value = json.loads(repo_sidecar.read_text(encoding="utf-8")).get("repo")
+            repo_value = json.loads(repo_sidecar.read_text(encoding="utf-8-sig")).get("repo")
         except (OSError, ValueError):
             repo_value = None
         if not repo_value:
