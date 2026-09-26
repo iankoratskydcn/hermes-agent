@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple, Optional
@@ -1752,7 +1753,33 @@ def switch_model(
         fail = step(st)
         if fail is not None:
             return fail
-    return _build_switch_result(st)
+    result = _build_switch_result(st)
+    if result.success:
+        try:
+            from agent.intervention_events import capture_model_intervention, capture_provider_intervention
+            from hermes_cli.route_identity import normalize_route_base_url
+            before = {"model": current_model, "provider": current_provider, "base_url": current_base_url or None}
+            after = {"model": result.new_model, "provider": result.target_provider, "base_url": result.base_url or None}
+            route_changed = (
+                result.new_model != current_model
+                or result.target_provider != current_provider
+                or normalize_route_base_url(result.base_url) != normalize_route_base_url(current_base_url)
+            )
+            if route_changed:
+                operation_id = uuid.uuid4().hex
+                capture_model_intervention(
+                    before=before, after=after,
+                    idempotency_key=f"model-switch:{operation_id}",
+                )
+                if result.target_provider != current_provider:
+                    capture_provider_intervention(
+                        before={"provider": current_provider, "base_url": current_base_url or None},
+                        after={"provider": result.target_provider, "base_url": result.base_url or None},
+                        source="model_switch", actor="system", idempotency_key=f"provider:{operation_id}",
+                    )
+        except Exception:
+            logger.debug("model intervention capture unavailable", exc_info=True)
+    return result
 
 
 def model_selection_config_updates(result: ModelSwitchResult, current_model_cfg: Any) -> dict[str, Any]:
@@ -1826,8 +1853,19 @@ def persist_model_selection(result: ModelSwitchResult, config_path: Any = None) 
     from hermes_cli.config import get_config_path, read_user_config_raw
     from utils import atomic_roundtrip_yaml_update
     path = Path(config_path) if config_path else get_config_path()
-    for key, value in model_selection_config_updates(result, read_user_config_raw(path).get("model")).items():
+    current_model_cfg = read_user_config_raw(path).get("model")
+    updates = model_selection_config_updates(result, current_model_cfg)
+    for key, value in updates.items():
         atomic_roundtrip_yaml_update(path, f"model.{key}", value)
+    try:
+        from agent.intervention_events import capture_config_intervention
+        capture_config_intervention(
+            before=current_model_cfg if isinstance(current_model_cfg, dict) else {},
+            after=apply_model_selection(current_model_cfg, result), source="model_config",
+            actor="system", idempotency_key=f"model-config:{uuid.uuid4().hex}",
+        )
+    except Exception:
+        logger.debug("config intervention capture unavailable", exc_info=True)
     try:  # owner-only: config files contain API keys
         os.chmod(path, 0o600)
     except (OSError, NotImplementedError):
