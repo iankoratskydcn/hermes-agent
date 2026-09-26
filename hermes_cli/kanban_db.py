@@ -1739,7 +1739,7 @@ def create_task(
                 "board": board or get_current_board(), "assignee": assignee, "run_id": None,
                 "project_id": project_id, "workspace_kind": workspace_kind,
             }
-            if getattr(conn, "in_transaction", False):
+            if id(conn) in _DEFERRED_LIFECYCLE_HOOKS:
                 _defer_lifecycle_hook(conn, "on_kanban_task_created", task_id, **hook_fields)
             else:
                 _fire_kanban_lifecycle_hook("on_kanban_task_created", task_id, **hook_fields)

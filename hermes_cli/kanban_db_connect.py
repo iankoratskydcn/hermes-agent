@@ -1296,7 +1296,11 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             _kb._discard_deferred_lifecycle_hooks(conn)
             raise
         # Post-commit torn-extend check — raise now rather than silently corrupt.
-        _check_file_length_invariant(conn)
+        try:
+            _check_file_length_invariant(conn)
+        except Exception:
+            _kb._discard_deferred_lifecycle_hooks(conn)
+            raise
         _kb._flush_deferred_lifecycle_hooks(conn)
 
 
