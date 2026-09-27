@@ -1,4 +1,5 @@
 import json
+import pytest
 import os
 import queue
 import subprocess
@@ -28,6 +29,7 @@ def _read_json_line(out: queue.Queue[dict], timeout: float = 2.0, *, phase: str 
         ) from exc
 
 
+@pytest.mark.platforms("linux")
 def test_compute_host_line_json_hello_and_shutdown():
     repo = Path(__file__).resolve().parents[2]
     env = dict(os.environ)

@@ -1553,6 +1553,31 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
 
 
+def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: int) -> bool:
+    """Worker-side half of ``_set_worker_pid``, run by the worker before its first model call.
+
+    A dispatcher killed between spawning the worker and ``_set_worker_pid`` leaves the run with no
+    pid: no liveness check can see the worker, so a TTL expiry reclaims the card and spawns a second
+    worker beside it. The worker fills the missing pid itself (``worker_registered``). False when
+    ``run_id`` is no longer the card's live run: the card was reclaimed before this worker got here,
+    and it must exit without working it."""
+    started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
+    with _kb.write_txn(conn):
+        row = conn.execute("SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
+                           (task_id,)).fetchone()
+        if row is None or row["status"] != "running" or row["current_run_id"] != int(run_id):
+            return False
+        # Liveness checks are host-local: a pid from another host (or pid namespace) proves nothing here.
+        if row["worker_pid"] is None and (row["claim_lock"] or "").startswith(_kb._host_prefix()):
+            conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                         (int(pid), started_at, task_id))
+            conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                         (int(pid), started_at, int(run_id)))
+            _kb._append_event(conn, task_id, "worker_registered", {"pid": int(pid), "started_at": started_at},
+                              run_id=int(run_id))
+    return True
+
+
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     """Reset the unified consecutive-failures counter.
 
@@ -2202,7 +2227,7 @@ def _projected_workspace(
     if not repo_value:
         implicit_repo = True
         try:
-            repo_value = json.loads(repo_sidecar.read_text(encoding="utf-8")).get("repo")
+            repo_value = json.loads(repo_sidecar.read_text(encoding="utf-8-sig")).get("repo")
         except (OSError, ValueError):
             repo_value = None
         if not repo_value:
@@ -2232,6 +2257,33 @@ def _projected_workspace(
     if implicit_repo:
         repo_sidecar.write_text(json.dumps({"repo": str(repo)}), encoding="utf-8")
     return handle.path
+
+
+def _persist_scholastic_context(
+    conn: sqlite3.Connection, task_id: str, context_pack: Any,
+) -> bool:
+    """Replace the reserved context field in the card body, once per run.
+
+    The worker already reads task bodies through ``build_worker_context``;
+    persisting one JSON field avoids a second prompt seam and makes retries
+    deterministic. Non-JSON bodies fail closed to normal spawning.
+    """
+    row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or not isinstance(row["body"], str):
+        return False
+    try:
+        body = json.loads(row["body"])
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(body, dict):
+        return False
+    body[_sidecar_route.SCHOLASTIC_CONTEXT_OUTPUT_KEY] = context_pack
+    try:
+        encoded = json.dumps(body, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return False
+    conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (encoded, task_id))
+    return True
 
 
 def _dispatch_lane_task(
@@ -2388,27 +2440,50 @@ def _dispatch_lane_task(
                 if secret_token is not None:
                     reset_secret_scope(secret_token)
             if sidecar_result is not None:
-                if not dry_run:
-                    with _kb.write_txn(conn):
-                        _kb._append_event(
-                            conn, task_id, "sidecar_routed",
-                            {"operation": sidecar_result.get("operation"),
-                             "backend": sidecar_result.get("_backend")},
+                context_enriched = False
+                if sidecar_result.get("operation") == _sidecar_route.SCHOLASTIC_CONTEXT_OPERATION:
+                    context_pack = _sidecar_route.scholastic_context_from_result(sidecar_result)
+                    if context_pack is None:
+                        sidecar_result = None
+                    elif not dry_run:
+                        with _kb.write_txn(conn):
+                            if not _persist_scholastic_context(conn, task_id, context_pack):
+                                sidecar_result = None
+                            else:
+                                _kb._append_event(
+                                    conn, task_id, "sidecar_context_enriched",
+                                    {"backend": sidecar_result.get("_backend"),
+                                     "operation": sidecar_result.get("operation")},
+                                )
+                        context_enriched = sidecar_result is not None
+                    else:
+                        # Dry runs do not mutate the body but still preserve
+                        # the ordinary spawn accounting below.
+                        context_enriched = True
+                if sidecar_result is not None and not context_enriched:
+                    if not dry_run:
+                        with _kb.write_txn(conn):
+                            _kb._append_event(
+                                conn, task_id, "sidecar_routed",
+                                {"operation": sidecar_result.get("operation"),
+                                 "backend": sidecar_result.get("_backend")},
+                            )
+                        _kb.complete_task(
+                            conn, task_id,
+                            result=json.dumps(sidecar_result.get("payload")),
+                            summary=f"Auto-routed to sidecar_service operation {sidecar_result.get('operation')!r}.",
+                            metadata={"sidecar_result": sidecar_result},
                         )
-                    _kb.complete_task(
-                        conn, task_id,
-                        result=json.dumps(sidecar_result.get("payload")),
-                        summary=f"Auto-routed to sidecar_service operation {sidecar_result.get('operation')!r}.",
-                        metadata={"sidecar_result": sidecar_result},
-                    )
-                result.spawned.append((task_id, assignee, ""))
-                return True
-            # STEP 4: tag every fallthrough (ineligible or failed dispatch) so a later
+                    result.spawned.append((task_id, assignee, ""))
+                    return True
+            # STEP 4: tag eligible-task fallthroughs (ineligible or failed dispatch) so a later
             # report can discover which task shapes recur often enough to justify a new
             # sidecar operation. Best-effort, no-ops without a session id (dry_run skips
-            # writes just like the "ok" branch above).
-            if not dry_run and task_for_sidecar is not None:
+            # writes just like the "ok" branch above). Successful Scholastic enrichment is
+            # deliberately not a fallthrough: it continues to the normal worker spawn.
+            if not dry_run and task_for_sidecar is not None and sidecar_result is None:
                 _sidecar_route.record_fallthrough(task_for_sidecar, task_for_sidecar.session_id)
+
 
     # Rule 4 (no-infinite-retry): once consecutive_failures hits
     # RETRY_CAP_ESCALATION_THRESHOLD, escalate to a PO via decision-hud

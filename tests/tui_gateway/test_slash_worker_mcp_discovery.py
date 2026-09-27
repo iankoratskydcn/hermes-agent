@@ -13,7 +13,7 @@ import threading
 import time
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 _mcp_server_mod = pytest.importorskip("mcp.server")
 
@@ -101,6 +101,8 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     (profile_home / "config.yaml").write_text(
         yaml.safe_dump(
             {
+                # Let real discovery finish before the CLI snapshots its tools.
+                "mcp_discovery_timeout": 30,
                 "mcp_servers": {
                     "profileprobe": {
                         "enabled": True,
@@ -145,6 +147,8 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         assert proc.stdin is not None
         assert proc.stdout is not None
         assert proc.stderr is not None
+        stdin = proc.stdin
+        stdout = proc.stdout
         stderr_thread = threading.Thread(
             target=_read_bounded_stderr,
             args=(proc.stderr, diagnostics),
@@ -152,22 +156,34 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         )
         stderr_thread.start()
         checkpoints["stderr_reader_start"] = time.monotonic()
-        stdout = proc.stdout
-        threading.Thread(
-            target=lambda: output.put(stdout.readline()),
-            daemon=True,
-        ).start()
+
+        def read_responses():
+            for line in stdout:
+                output.put(line)
+            output.put("")
+
+        threading.Thread(target=read_responses, daemon=True).start()
         checkpoints["stdout_reader_start"] = time.monotonic()
-        proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
-        proc.stdin.flush()
-        checkpoints["request_flush"] = time.monotonic()
-        try:
-            line = output.get(timeout=10)
-        except queue.Empty:
-            checkpoints["timeout"] = time.monotonic()
-            pytest.fail(_format_timeout_diagnostics(diagnostics, proc, checkpoints))
-        response = json.loads(line)
-        assert response["ok"] is True
+
+        def request(request_id, command, timeout):
+            stdin.write(json.dumps({"id": request_id, "command": command}) + "\n")
+            stdin.flush()
+            checkpoints[f"request_{request_id}_flush"] = time.monotonic()
+            try:
+                line = output.get(timeout=timeout)
+            except queue.Empty:
+                checkpoints[f"request_{request_id}_timeout"] = time.monotonic()
+                pytest.fail(_format_timeout_diagnostics(diagnostics, proc, checkpoints))
+            assert line, f"slash worker exited before answering {command}"
+            response = json.loads(line)
+            assert response["id"] == request_id
+            assert response["ok"] is True, response
+            return response
+
+        # Cold imports and real MCP startup have their own budget; the warm
+        # command must still answer promptly, with the tool already present.
+        request(1, "/version", 60)
+        response = request(2, "/tools", 10)
         assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
     finally:
         checkpoints.setdefault("cleanup_start", time.monotonic())
