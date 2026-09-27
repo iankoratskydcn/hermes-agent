@@ -152,6 +152,8 @@ class DispatchResult:
     ``kanban.gate_precheck_enabled`` is set in ``config.yaml``. Distinct from
     ``respawn_guarded`` (a different, always-on mechanism) so telemetry can
     tell them apart."""
+    skipped_execution_envelope: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks refused by the opt-in fail-closed execution-envelope gate."""
     provider_budget_blocked: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` refused because the assignee's provider account
     (``kanban.provider_budgets``, see ``kanban_provider_budget.py``) is over
@@ -1551,6 +1553,31 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
 
 
+def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: int) -> bool:
+    """Worker-side half of ``_set_worker_pid``, run by the worker before its first model call.
+
+    A dispatcher killed between spawning the worker and ``_set_worker_pid`` leaves the run with no
+    pid: no liveness check can see the worker, so a TTL expiry reclaims the card and spawns a second
+    worker beside it. The worker fills the missing pid itself (``worker_registered``). False when
+    ``run_id`` is no longer the card's live run: the card was reclaimed before this worker got here,
+    and it must exit without working it."""
+    started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
+    with _kb.write_txn(conn):
+        row = conn.execute("SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
+                           (task_id,)).fetchone()
+        if row is None or row["status"] != "running" or row["current_run_id"] != int(run_id):
+            return False
+        # Liveness checks are host-local: a pid from another host (or pid namespace) proves nothing here.
+        if row["worker_pid"] is None and (row["claim_lock"] or "").startswith(_kb._host_prefix()):
+            conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                         (int(pid), started_at, task_id))
+            conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                         (int(pid), started_at, int(run_id)))
+            _kb._append_event(conn, task_id, "worker_registered", {"pid": int(pid), "started_at": started_at},
+                              run_id=int(run_id))
+    return True
+
+
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     """Reset the unified consecutive-failures counter.
 
@@ -2200,7 +2227,7 @@ def _projected_workspace(
     if not repo_value:
         implicit_repo = True
         try:
-            repo_value = json.loads(repo_sidecar.read_text(encoding="utf-8")).get("repo")
+            repo_value = json.loads(repo_sidecar.read_text(encoding="utf-8-sig")).get("repo")
         except (OSError, ValueError):
             repo_value = None
         if not repo_value:
@@ -2322,6 +2349,29 @@ def _dispatch_lane_task(
                 result.skipped_gate_precheck.append((task_id, precheck["reason"]))
                 return False
 
+    if execution_envelope_enabled():
+        task_for_envelope = _kb.get_task(conn, task_id)
+        if task_for_envelope is not None:
+            from hermes_cli.kanban_execution_envelope import envelope_from_task, validate_execution_envelope
+            envelope = envelope_from_task(task_for_envelope)
+            if lane == "review":
+                review_event = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
+                    "ORDER BY id DESC LIMIT 1", (task_id,),
+                ).fetchone()
+                payload = _kb._json_dict(review_event["payload"]) if review_event else {}
+                envelope["assignee"] = payload.get("implementer")
+                envelope["reviewer"] = task_for_envelope.assignee
+            checked = validate_execution_envelope(envelope)
+            if not checked.ok:
+                result.skipped_execution_envelope.append((task_id, "; ".join(checked.errors)))
+                if not dry_run:
+                    with _kb.write_txn(conn):
+                        _kb._append_event(conn, task_id, "execution_envelope_blocked", {
+                            "errors": checked.errors, "correction": checked.correction,
+                        })
+                return False
+
     # Rolling-window provider-quota guard (kanban.provider_budgets): pools
     # rate-limited exits across every profile sharing one provider account so
     # a fan-out can't hammer the same 429 wall from N independent per-task
@@ -2426,6 +2476,14 @@ def _dispatch_lane_task(
                         )
                     result.spawned.append((task_id, assignee, ""))
                     return True
+            # STEP 4: tag eligible-task fallthroughs (ineligible or failed dispatch) so a later
+            # report can discover which task shapes recur often enough to justify a new
+            # sidecar operation. Best-effort, no-ops without a session id (dry_run skips
+            # writes just like the "ok" branch above). Successful Scholastic enrichment is
+            # deliberately not a fallthrough: it continues to the normal worker spawn.
+            if not dry_run and task_for_sidecar is not None and sidecar_result is None:
+                _sidecar_route.record_fallthrough(task_for_sidecar, task_for_sidecar.session_id)
+
 
     # Rule 4 (no-infinite-retry): once consecutive_failures hits
     # RETRY_CAP_ESCALATION_THRESHOLD, escalate to a PO via decision-hud
@@ -2927,8 +2985,17 @@ def _dispatch_once_locked(
 
     ready_rows = _lane_rows(conn, "ready")
     # Review rows are enumerated up front so the budget split can see whether
-    # review work exists at all.
-    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    # review work exists at all. Gate on both profile config AND board metadata,
+    # fail-closed: board metadata `review_dispatch_enabled=false` stops all review
+    # spawns regardless of profile config.
+    board_review_dispatch_enabled = _kb.read_board_metadata(board=board).get(
+        "review_dispatch_enabled", True
+    )
+    review_rows = (
+        _lane_rows(conn, "review")
+        if review_dispatch_enabled() and board_review_dispatch_enabled
+        else []
+    )
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
     # Resolved BEFORE the review reservation so the reservation can see which
@@ -3023,6 +3090,17 @@ def gate_precheck_enabled(kanban_cfg: Optional[dict] = None) -> bool:
     if not isinstance(kanban_cfg, dict):
         kanban_cfg = {}
     return bool(kanban_cfg.get("gate_precheck_enabled", False))
+
+
+def execution_envelope_enabled(kanban_cfg: Optional[dict] = None) -> bool:
+    """Whether strict project/worktree/owner/proof metadata gates dispatch."""
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config
+            kanban_cfg = load_config().get("kanban") or {}
+        except Exception:
+            kanban_cfg = {}
+    return isinstance(kanban_cfg, dict) and bool(kanban_cfg.get("execution_envelope_enabled", False))
 
 
 def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, int]:

@@ -442,9 +442,15 @@ def get_current_board() -> str:
     try:
         f = current_board_path()
         if f.exists():
-            found = _existing(f.read_text(encoding="utf-8").strip())
-            if found:
-                return found
+            # utf-8-sig read fix (ours): tolerate BOM-persisted current-board files.
+            val = f.read_text(encoding="utf-8-sig").strip()
+            if val:
+                try:
+                    normed = _normalize_board_slug(val)
+                    if normed and board_exists(normed):
+                        return normed
+                except ValueError:
+                    pass
     except OSError:
         pass
     return DEFAULT_BOARD
@@ -635,7 +641,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         file_exists = False
     if file_exists:
         try:
-            raw = json.loads(p.read_text(encoding="utf-8"))
+            raw = json.loads(p.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             # File exists but could not be parsed — corruption (e.g. a torn
             # write or invalid UTF-8), not "no board.json yet". Fail closed on
@@ -1533,6 +1539,33 @@ def create_task(
     skills_list = _normalize_task_skills(skills)
     scope_paths_list = list(scope_paths) if scope_paths is not None else None
     obligations_list = list(obligations) if obligations is not None else None
+    scope_manifest = scope_manifest if isinstance(scope_manifest, dict) else None
+    try:
+        from hermes_cli.config import load_config
+        envelope_enabled = bool((load_config().get("kanban") or {}).get(
+            "execution_envelope_enabled", False
+        ))
+    except Exception:
+        envelope_enabled = False
+    if envelope_enabled:
+        from hermes_cli.kanban_execution_envelope import validate_execution_envelope
+        envelope = {
+            "project_id": project_id,
+            "repo_path": project_repo or (scope_manifest or {}).get("repo_path"),
+            "workspace_kind": workspace_kind,
+            "workspace_path": workspace_path,
+            "branch_name": branch_name,
+            "assignee": assignee,
+            "reviewer": (scope_manifest or {}).get("reviewer"),
+            "skills": skills_list,
+            "dependencies": (scope_manifest or {}).get("dependencies"),
+            "proof_command": (scope_manifest or {}).get("proof_command"),
+            "stop_condition": (scope_manifest or {}).get("stop_condition"),
+            "idempotency_key": idempotency_key,
+        }
+        checked = validate_execution_envelope(envelope)
+        if not checked.ok:
+            raise ValueError("execution envelope invalid: " + "; ".join(checked.errors))
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1544,6 +1577,30 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
+    if envelope_enabled and scope_manifest and scope_manifest.get("source_fingerprint"):
+        from hermes_cli.kanban_execution_envelope import normalized_fingerprint
+        candidate = normalized_fingerprint({
+            "project_id": project_id,
+            "outcome": scope_manifest.get("outcome") or title,
+            "source_fingerprint": scope_manifest.get("source_fingerprint"),
+        })
+        active_rows = conn.execute(
+            "SELECT id, project_id, title, scope_manifest FROM tasks "
+            "WHERE project_id = ? AND status NOT IN ('done', 'archived')",
+            (project_id,),
+        ).fetchall()
+        for active in active_rows:
+            existing_manifest = _json_dict(active["scope_manifest"])
+            existing = normalized_fingerprint({
+                "project_id": active["project_id"],
+                "outcome": existing_manifest.get("outcome") or active["title"],
+                "source_fingerprint": existing_manifest.get("source_fingerprint"),
+            })
+            if existing == candidate:
+                raise ValueError(
+                    f"duplicate active outcome fingerprint; existing task {active['id']!r} "
+                    "must be completed, archived, or given a distinct source_fingerprint"
+                )
 
     now = int(time.time())
 
@@ -2715,8 +2772,10 @@ def release_stale_claims(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (retry_status, row["id"], row["claim_lock"], now),
+                "AND claim_expires IS NOT NULL AND claim_expires < ? "
+                # A worker that registered its own pid since the SELECT keeps its claim.
+                "AND worker_pid IS ?",
+                (retry_status, row["id"], row["claim_lock"], now, row["worker_pid"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -2962,6 +3021,28 @@ def _claim_is_live(trow) -> bool:
     )
 
 
+def _verify_worktree_handoff(
+    conn: sqlite3.Connection, task_id: str, *, event_kind: str,
+) -> tuple[bool, Optional[str]]:
+    """Reject terminal handoffs from detached, dirty, or unregistered worktrees."""
+    task = get_task(conn, task_id)
+    if task is None:
+        return True, None
+    from hermes_cli.kanban_worktree_guard import verify_task_worktree
+
+    checked = verify_task_worktree(task)
+    if checked.ok:
+        return True, None
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            event_kind,
+            {"reason": checked.reason, "workspace_path": task.workspace_path},
+        )
+    return False, checked.reason
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -2986,6 +3067,11 @@ def complete_task(
     auditable event. Approving a card out of ``review`` stays exempt.
     """
     now = int(time.time())
+    worktree_ok, _worktree_reason = _verify_worktree_handoff(
+        conn, task_id, event_kind="completion_blocked_worktree",
+    )
+    if not worktree_ok:
+        return False
     # Isolation ingest is a mandatory pre-completion gate. It quarantines on
     # malformed/missing scope or unauthorized diff; callers cannot opt out.
     from hermes_cli.kanban_ingest import run_ingest_pipeline
@@ -3622,6 +3708,11 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    worktree_ok, worktree_reason = _verify_worktree_handoff(
+        conn, task_id, event_kind="review_blocked_worktree",
+    )
+    if not worktree_ok:
+        return _ret(False, worktree_reason)
     # Declared (metadata["artifacts"]) and prose-referenced files
     # must be durable BEFORE anything can clean the scratch workspace up: for a
     # review-bound card the reviewer's completion is the cleanup trigger.
@@ -3658,6 +3749,24 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
             reviewer = _canonical_assignee(reviewer)
+            try:
+                from hermes_cli.config import load_config
+                envelope_enabled = bool((load_config().get("kanban") or {}).get(
+                    "execution_envelope_enabled", False
+                ))
+            except Exception:
+                envelope_enabled = False
+            if envelope_enabled:
+                from hermes_cli.kanban_execution_envelope import envelope_from_task, validate_execution_envelope
+                envelope_task = get_task(conn, task_id)
+                checked = validate_execution_envelope(
+                    envelope_from_task(envelope_task, reviewer=reviewer)
+                ) if envelope_task is not None else None
+                if checked is None or not checked.ok:
+                    reason = "execution envelope invalid"
+                    if checked is not None:
+                        reason += ": " + "; ".join(checked.errors)
+                    return _ret(False, reason)
             # The actor is the run that did the work. ``assignee`` is the actor
             # only while a worker holds the card; on a never-claimed card it is
             # whoever the operator assigned -- possibly the reviewer itself,
@@ -4609,7 +4718,7 @@ def read_worker_log(
         return None
     try:
         if tail_bytes is None:
-            return path.read_text(encoding="utf-8", errors="replace")
+            return path.read_text(encoding="utf-8-sig", errors="replace")
         size = path.stat().st_size
         with open(path, "rb") as f:
             if size > tail_bytes:
@@ -4730,6 +4839,22 @@ def latest_summaries(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, int]:
+    """``{task_id: started_at of the run ``tasks.current_run_id`` points at}``
+    in one query; tasks with no active run (NULL or dangling pointer) are omitted."""
+    ids = list(task_ids)
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        "SELECT t.id AS task_id, r.started_at AS started_at FROM tasks t "
+        "JOIN task_runs r ON r.id = t.current_run_id "
+        f"WHERE t.id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    return {r["task_id"]: r["started_at"] for r in rows}
 
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
