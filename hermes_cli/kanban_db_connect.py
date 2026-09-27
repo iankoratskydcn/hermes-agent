@@ -633,14 +633,16 @@ def _schema_is_present(conn: sqlite3.Connection) -> bool:
 def _validate_scholastic_receipts_schema(conn: sqlite3.Connection) -> None:
     """Fail closed if an existing receipt table has drifted from the contract."""
     expected = {
-        "board": 1, "project_id": 2, "task_id": 3, "run_id": 4,
-        "canonical_stage_id": 5, "attempt_id": 6, "receipt_schema_version": 0,
-        "receipt_json": 0, "receipt_hash": 0, "created_at": 0,
+        "board": ("TEXT", 1, 1), "project_id": ("TEXT", 0, 2),
+        "task_id": ("TEXT", 1, 3), "run_id": ("TEXT", 1, 4),
+        "canonical_stage_id": ("TEXT", 1, 5), "attempt_id": ("TEXT", 1, 6),
+        "receipt_schema_version": ("TEXT", 1, 0), "receipt_json": ("TEXT", 1, 0),
+        "receipt_hash": ("TEXT", 1, 0), "created_at": ("TEXT", 1, 0),
     }
     rows = conn.execute("PRAGMA table_info(scholastic_receipts)").fetchall()
     if not rows:
         raise RuntimeError("scholastic_receipts table is missing after schema initialization")
-    actual = {row["name"]: int(row["pk"]) for row in rows}
+    actual = {row["name"]: (str(row["type"]).upper(), int(row["notnull"]), int(row["pk"])) for row in rows}
     if actual != expected:
         raise RuntimeError(
             "scholastic_receipts schema drift detected; refusing to use existing table "

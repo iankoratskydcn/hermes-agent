@@ -133,3 +133,32 @@ def test_typed_payload_fields_fail_closed(tmp_path, field, value):
     kwargs = dict(board="default", project_id="project-1", task_id="task-1", run_id="7", canonical_stage_id="1", attempt_id="attempt-1")
     with pytest.raises(ReceiptError):
         put_scholastic_receipt(conn, receipt=payload, **kwargs)
+
+
+def test_payload_identity_must_match_storage_scope(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_task(conn)
+    payload = _receipt()
+    payload["receipt"] = {**payload["receipt"], "identity": {**payload["receipt"]["identity"], "run_id": "other-run"}}
+    payload["receipt_hash"] = receipt_hash(payload["receipt"])
+    kwargs = dict(board="default", project_id="project-1", task_id="task-1", run_id="7", canonical_stage_id="1", attempt_id="attempt-1")
+    with pytest.raises(ReceiptError, match="storage scope"):
+        put_scholastic_receipt(conn, receipt=payload, **kwargs)
+
+
+def test_receipt_schema_type_drift_fails_closed(tmp_path):
+    path = tmp_path / "typed-drift.db"
+    raw = sqlite3.connect(path)
+    raw.executescript("""
+        CREATE TABLE tasks (id TEXT PRIMARY KEY);
+        CREATE TABLE scholastic_receipts (
+            board TEXT NOT NULL, project_id TEXT, task_id TEXT NOT NULL, run_id TEXT NOT NULL,
+            canonical_stage_id TEXT NOT NULL, attempt_id TEXT NOT NULL,
+            receipt_schema_version INTEGER NOT NULL, receipt_json TEXT NOT NULL,
+            receipt_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY (board, project_id, task_id, run_id, canonical_stage_id, attempt_id)
+        );
+    """)
+    raw.close()
+    with pytest.raises(RuntimeError, match="schema drift"):
+        kbc.connect(path)

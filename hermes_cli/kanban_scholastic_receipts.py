@@ -171,6 +171,11 @@ def put_scholastic_receipt(conn: sqlite3.Connection, *, board: str, project_id: 
                            attempt_id: str, receipt: Mapping[str, Any]) -> ReceiptWriteResult:
     _validate_scope(board, project_id, task_id, run_id, canonical_stage_id, attempt_id)
     validated = validate_receipt(receipt)
+    identity = validated["receipt"]["identity"]
+    identity_stage = identity.get("canonical_stage_id", identity["stage_id"])
+    if (identity["run_id"] != run_id or identity["attempt_id"] != attempt_id
+            or str(identity_stage) != canonical_stage_id):
+        raise ReceiptError("receipt identity does not match storage scope")
     key = (board, project_id, task_id, run_id, canonical_stage_id, attempt_id)
     payload_json = canonical_json(validated)
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
