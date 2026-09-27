@@ -562,8 +562,15 @@ export interface SessionInfo {
   message_count: number
   model: null | string
   output_tokens: number
-  /** Parent conversation when this row is a /branch fork. */
+  /** Parent conversation id. Written for genuine /branch forks *and* for
+   *  /new / idle / daily resets (durable lineage). Nesting uses
+   *  {@link _branched_from} vs {@link _reset_from}, not this field alone. */
   parent_session_id?: null | string
+  /** Predecessor of a /new or idle/daily reset. Not a fork — the sidebar
+   *  renders these as siblings of the previous topic. */
+  _reset_from?: null | string
+  /** Parent of a genuine /branch fork. The sidebar nests only these. */
+  _branched_from?: null | string
   /** Durable server-side pin flag (`sessions.pinned`). The list endpoints
    *  back-fill pinned conversations past their LIMIT, so a pinned row is
    *  always present in a page — which makes this authoritative for the
@@ -1322,6 +1329,11 @@ export interface SessionSearchResult {
   session_started: number | null
   snippet: string
   source: string | null
+  /** Real session title from the sessions table; the backend enriches every
+   *  search hit with it (web_routers/sessions.py add_lineage_result), absent
+   *  for untitled sessions. The sidebar maps it onto the synthesized row so
+   *  search hits show the actual name, not the matched-message snippet. */
+  title?: string | null
 }
 
 export interface SessionSearchResponse {
