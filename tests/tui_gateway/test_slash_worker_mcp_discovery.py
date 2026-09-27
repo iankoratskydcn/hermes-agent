@@ -10,6 +10,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 
 import pytest
 import hermes_yaml as yaml
@@ -23,6 +24,55 @@ if not hasattr(_mcp_server_mod, "MCPServer"):
     pytest.skip(
         "profile-local MCP discovery probe requires mcp >= 2.0 (MCPServer)",
         allow_module_level=True,
+    )
+
+
+
+
+_MAX_STDERR_BYTES = 16_384
+_MAX_STDERR_LINES = 64
+
+
+def _read_bounded_stderr(stream, diagnostics: dict[str, object]) -> None:
+    retained: list[str] = []
+    retained_bytes = 0
+    total_bytes = 0
+    total_lines = 0
+    truncated = False
+    for line in stream:
+        encoded = line.encode("utf-8", errors="replace")
+        total_bytes += len(encoded)
+        total_lines += 1
+        if len(retained) >= _MAX_STDERR_LINES or retained_bytes >= _MAX_STDERR_BYTES:
+            truncated = True
+            continue
+        available = _MAX_STDERR_BYTES - retained_bytes
+        if len(encoded) > available:
+            retained.append(encoded[:available].decode("utf-8", errors="replace"))
+            retained_bytes += available
+            truncated = True
+        else:
+            retained.append(line.rstrip("\n"))
+            retained_bytes += len(encoded)
+    diagnostics.update(
+        stderr="\n".join(retained),
+        stderr_bytes=total_bytes,
+        stderr_lines=total_lines,
+        stderr_truncated=truncated,
+    )
+
+
+def _format_timeout_diagnostics(
+    diagnostics: dict[str, object], proc: subprocess.Popen[str], checkpoints: dict[str, float]
+) -> str:
+    elapsed = {name: round(value - checkpoints["popen"], 3) for name, value in checkpoints.items()}
+    return (
+        "slash worker produced no /tools response within 10 seconds; "
+        f"pid={proc.pid} poll={proc.poll()} checkpoints={elapsed} "
+        f"stderr_bytes={diagnostics.get('stderr_bytes', 0)} "
+        f"stderr_lines={diagnostics.get('stderr_lines', 0)} "
+        f"stderr_truncated={diagnostics.get('stderr_truncated', False)} "
+        f"stderr={diagnostics.get('stderr', '')!r}"
     )
 
 
@@ -89,25 +139,41 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         env=env,
         cwd=tmp_path,
     )
+    checkpoints = {"popen": time.monotonic()}
+    diagnostics: dict[str, object] = {}
     output: queue.Queue[str] = queue.Queue()
+    stderr_thread: threading.Thread | None = None
     try:
         assert proc.stdin is not None
         assert proc.stdout is not None
+        assert proc.stderr is not None
+        stdin = proc.stdin
+        stdout = proc.stdout
+        stderr_thread = threading.Thread(
+            target=_read_bounded_stderr,
+            args=(proc.stderr, diagnostics),
+            daemon=True,
+        )
+        stderr_thread.start()
+        checkpoints["stderr_reader_start"] = time.monotonic()
 
         def read_responses():
-            for line in proc.stdout:
+            for line in stdout:
                 output.put(line)
             output.put("")
 
         threading.Thread(target=read_responses, daemon=True).start()
+        checkpoints["stdout_reader_start"] = time.monotonic()
 
         def request(request_id, command, timeout):
-            proc.stdin.write(json.dumps({"id": request_id, "command": command}) + "\n")
-            proc.stdin.flush()
+            stdin.write(json.dumps({"id": request_id, "command": command}) + "\n")
+            stdin.flush()
+            checkpoints[f"request_{request_id}_flush"] = time.monotonic()
             try:
                 line = output.get(timeout=timeout)
             except queue.Empty:
-                pytest.fail(f"slash worker did not answer {command} within {timeout}s")
+                checkpoints[f"request_{request_id}_timeout"] = time.monotonic()
+                pytest.fail(_format_timeout_diagnostics(diagnostics, proc, checkpoints))
             assert line, f"slash worker exited before answering {command}"
             response = json.loads(line)
             assert response["id"] == request_id
@@ -120,9 +186,18 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         response = request(2, "/tools", 10)
         assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
+        checkpoints.setdefault("cleanup_start", time.monotonic())
+        if proc.poll() is None:
+            proc.terminate()
+            checkpoints["terminate"] = time.monotonic()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                checkpoints["kill"] = time.monotonic()
+                proc.wait(timeout=5)
+        else:
+            checkpoints.setdefault("terminate", time.monotonic())
+        checkpoints["reap"] = time.monotonic()
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=1)

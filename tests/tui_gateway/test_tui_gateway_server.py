@@ -2500,7 +2500,7 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
     assert result is not None
     assert {"memory", "project"} <= set(result)
     assert "kanban" not in result
-    assert set(result) - {"memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    assert set(result) - {"memory", "project", "desktop_ui"} <= _RECENTLY_SHIPPED_TOOLSETS
     err = capsys.readouterr().err
     assert "mcp-off" in err
 
@@ -2525,7 +2525,7 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
     assert result is not None
     assert {"memory", "project"} <= set(result)
     assert "kanban" not in result
-    assert set(result) - {"memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    assert set(result) - {"memory", "project", "desktop_ui"} <= _RECENTLY_SHIPPED_TOOLSETS
     assert capsys.readouterr().err.strip()  # a fallback warning is printed
 
 
@@ -16734,7 +16734,7 @@ def test_model_options_propagates_list_exception(monkeypatch):
 
 
 
-def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypatch):
+def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypatch, tmp_path):
     from hermes_cli.inventory import ConfigContext
 
     class _Agent:
@@ -16759,6 +16759,10 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
         "hermes_cli.runtime_provider.canonical_custom_identity",
         canonical,
     )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "empty-claude"))
+    monkeypatch.setattr("agent.anthropic_credentials.read_claude_code_credentials", lambda: {})
+    monkeypatch.setattr("agent.anthropic_credentials.read_hermes_oauth_credentials", lambda: {})
+    monkeypatch.setattr("hermes_cli.auth.read_credential_pool", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         "hermes_cli.model_switch.list_authenticated_providers",
         lambda **_kwargs: [

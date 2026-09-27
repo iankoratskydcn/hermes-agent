@@ -31,9 +31,26 @@ def kanban_home(tmp_path, monkeypatch):
 def _fake_spawn_factory(spawns: list):
     """Capture spawn calls for inspection."""
     def fake_spawn(task, workspace, board=None):
-        spawns.append({"task_id": task.id, "board": board, "lane": task.status})
+        spawns.append({"task_id": task.id, "board": board, "run_id": task.current_run_id})
         return 42
     return fake_spawn
+
+
+def _claimed_lane(spawn: dict) -> str:
+    """Classify a claimed spawn from its durable claimed event, not status."""
+    with kbc.connect(board=spawn["board"]) as conn:
+        events = [
+            event for event in kb.list_events(conn, spawn["task_id"])
+            if event.kind == "claimed" and event.run_id == spawn["run_id"]
+        ]
+    assert len(events) == 1, f"expected one matching claimed event: {spawn}"
+    payload = events[0].payload
+    assert isinstance(payload, dict), payload
+    source_status = payload.get("source_status")
+    if source_status == "review":
+        return "review"
+    assert "source_status" not in payload, payload
+    return "ready"
 
 
 def _set_task_status(conn, task_id: str, status: str) -> None:
@@ -73,7 +90,7 @@ class TestReviewDispatchBoardGate:
 
         # Assertions:
         # - No spawns should have occurred for review lane
-        assert len([s for s in spawns if s["lane"] == "review"]) == 0, \
+        assert len([s for s in spawns if _claimed_lane(s) == "review"]) == 0, \
             "Review card must NOT spawn when board review_dispatch_enabled=false"
 
         # - The review card should still be in review lane, unclaimed
@@ -108,7 +125,7 @@ class TestReviewDispatchBoardGate:
             )
 
         # Review card SHOULD be spawned
-        review_spawns = [s for s in spawns if s["lane"] == "review"]
+        review_spawns = [s for s in spawns if _claimed_lane(s) == "review"]
         assert len(review_spawns) >= 1, \
             "Review card must spawn when board review_dispatch_enabled=true"
         assert any(s["task_id"] == review_id for s in review_spawns)
@@ -134,7 +151,7 @@ class TestReviewDispatchBoardGate:
             )
 
         # Should allow spawn (default true for backward compatibility)
-        review_spawns = [s for s in spawns if s["lane"] == "review"]
+        review_spawns = [s for s in spawns if _claimed_lane(s) == "review"]
         assert len(review_spawns) >= 1, \
             "Absent board metadata key must default to true (legacy boards must keep working)"
 
@@ -173,7 +190,7 @@ class TestReviewDispatchBoardGate:
             )
 
         # The gate must block ALL review spawns
-        review_spawns = [s for s in spawns if s["lane"] == "review"]
+        review_spawns = [s for s in spawns if _claimed_lane(s) == "review"]
         assert len(review_spawns) == 0, \
             "Compound AND gate must block all review spawns when board false, " \
             f"even though profile config enables. Spawned: {spawns}"
@@ -213,16 +230,16 @@ class TestReviewDispatchBoardGate:
             )
 
         # Ready task SHOULD spawn
-        ready_spawns = [s for s in spawns if s["lane"] == "ready"]
+        ready_spawns = [s for s in spawns if _claimed_lane(s) == "ready"]
         assert len(ready_spawns) >= 1, \
             "Ready task must still spawn when review_dispatch is disabled"
 
         # Review task must NOT spawn
-        review_spawns = [s for s in spawns if s["lane"] == "review"]
+        review_spawns = [s for s in spawns if _claimed_lane(s) == "review"]
         assert len(review_spawns) == 0, \
             "Review task must not spawn when review_dispatch_enabled=false"
 
-    def test_malformed_board_metadata_defaults_to_true(
+    def test_truthy_string_board_metadata_enables_review_dispatch(
         self, kanban_home, all_assignees_spawnable
     ):
         """Non-boolean review_dispatch_enabled value defaults safely to true."""
@@ -242,6 +259,6 @@ class TestReviewDispatchBoardGate:
 
         # Must fail closed: treat non-false as true (default)
         # .get(..., True) will treat "yes" (truthy) as enabled → allow spawn
-        review_spawns = [s for s in spawns if s["lane"] == "review"]
+        review_spawns = [s for s in spawns if _claimed_lane(s) == "review"]
         assert len(review_spawns) >= 1, \
             "Malformed metadata (truthy non-bool) must allow spawn (fail-open for legacy)"

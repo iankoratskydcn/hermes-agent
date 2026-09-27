@@ -30,6 +30,9 @@ import functools
 import json
 import os
 from pathlib import Path
+from typing import Optional
+
+import pytest
 
 import pytest
 
@@ -134,11 +137,42 @@ def _iter_which_calls(tree: ast.AST):
             yield first.value, node.lineno
 
 
+class _LocalBindings(ast.NodeVisitor):
+    """Collect names bound in one lexical function scope, not nested scopes."""
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Store):
+            self.names.add(node.id)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            self.names.add(alias.asname or alias.name.split(".", 1)[0])
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        for alias in node.names:
+            if alias.name != "*":
+                self.names.add(alias.asname or alias.name)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.names.add(node.name)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.names.add(node.name)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.names.add(node.name)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
+
 class _ResolutionSiteVisitor(ast.NodeVisitor):
     def __init__(self, tree: ast.Module) -> None:
         self._scope: list[tuple[str, bool]] = []
-        self._shutil_aliases = {"shutil"}
-        self._which_aliases: set[str] = set()
+        self._bindings: list[dict[str, str]] = [{}]
         self.sites: set[tuple[str, str]] = set()
         self.visit(tree)
 
@@ -153,30 +187,104 @@ class _ResolutionSiteVisitor(ast.NodeVisitor):
             parts.append(name)
         return ".".join(parts)
 
+    def _lookup(self, name: str) -> Optional[str]:
+        for bindings in reversed(self._bindings):
+            binding = bindings.get(name)
+            if binding is not None:
+                return binding
+        return None
+
+    def _bind(self, name: str, binding: str) -> None:
+        self._bindings[-1][name] = binding
+
+    @staticmethod
+    def _local_names(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> set[str]:
+        collector = _LocalBindings()
+        body = getattr(node, "body", [])
+        if isinstance(body, list):
+            for statement in body:
+                collector.visit(statement)
+        else:
+            collector.visit(body)
+        args = node.args
+        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+            collector.names.add(arg.arg)
+        if args.vararg:
+            collector.names.add(args.vararg.arg)
+        if args.kwarg:
+            collector.names.add(args.kwarg.arg)
+        return collector.names
+
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
-            if alias.name == "shutil":
-                self._shutil_aliases.add(alias.asname or alias.name)
+            name = alias.asname or alias.name.split(".", 1)[0]
+            self._bind(name, "shutil" if alias.name == "shutil" else "shadow")
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        if node.module == "shutil":
-            for alias in node.names:
-                if alias.name == "which":
-                    self._which_aliases.add(alias.asname or alias.name)
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            name = alias.asname or alias.name
+            self._bind(
+                name,
+                "which" if node.module == "shutil" and alias.name == "which" else "shadow",
+            )
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Store):
+            self._bind(node.id, "shadow")
 
     def _visit_scope(self, node: ast.AST, name: str, *, is_function: bool) -> None:
         self._scope.append((name, is_function))
-        self.generic_visit(node)
+        if is_function and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            self._bindings.append({local: "shadow" for local in self._local_names(node)})
+        else:
+            self._bindings.append({})
+        if isinstance(node, ast.Lambda):
+            self.visit(node.body)
+        else:
+            for child in getattr(node, "body", []):
+                self.visit(child)
+        self._bindings.pop()
         self._scope.pop()
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._bind(node.name, "shadow")
+        for child in (*node.decorator_list, *node.bases, *node.keywords):
+            self.visit(child)
         self._visit_scope(node, node.name, is_function=False)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._bind(node.name, "shadow")
+        for child in (*node.decorator_list, node.args, node.returns) if node.returns else (*node.decorator_list, node.args):
+            self.visit(child)
         self._visit_scope(node, node.name, is_function=True)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._bind(node.name, "shadow")
+        children = (*node.decorator_list, node.args, node.returns) if node.returns else (*node.decorator_list, node.args)
+        for child in children:
+            self.visit(child)
         self._visit_scope(node, node.name, is_function=True)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._bindings.append({local: "shadow" for local in self._local_names(node)})
+        self.visit(node.body)
+        self._bindings.pop()
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for target in node.targets:
+            self.visit(target)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value:
+            self.visit(node.value)
+        self.visit(node.target)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+        self.visit(node.target)
 
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
@@ -184,10 +292,12 @@ class _ResolutionSiteVisitor(ast.NodeVisitor):
             isinstance(func, ast.Attribute)
             and func.attr == "which"
             and isinstance(func.value, ast.Name)
-            and func.value.id in self._shutil_aliases
+            and self._lookup(func.value.id) == "shutil"
         )
-        is_imported_which = isinstance(func, ast.Name) and func.id in self._which_aliases
-        if is_shutil_which or is_imported_which:
+        is_imported_which = isinstance(func, ast.Name) and self._lookup(func.id) == "which"
+        first = node.args[0] if node.args else None
+        if ((is_shutil_which or is_imported_which)
+                and not (isinstance(first, ast.Constant) and first.value == "bwrap")):
             self.sites.add((self._symbol, "bare_which"))
         self.generic_visit(node)
 
@@ -349,6 +459,34 @@ def test_allowlist_has_no_stale_entries():
         "fixed or moved. Remove them:\n"
         + "\n".join(f"  {rel} ({cmd})" for rel, cmd in stale)
     )
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ('import shutil as fs\nfs.which("uv")', {(MODULE_MARKER, "bare_which")}),
+        ('from shutil import which as resolve\nresolve("uv")', {(MODULE_MARKER, "bare_which")}),
+        ('import shutil\nshutil = object()\nshutil.which("uv")', set()),
+        ('from shutil import which\nwhich = lambda value: value\nwhich("uv")', set()),
+        ('shutil.which("uv")\nimport shutil', set()),
+        (
+            'import shutil\ndef resolve():\n    return shutil.which("uv")',
+            {("resolve", "bare_which")},
+        ),
+        (
+            'import shutil\ndef resolve():\n    shutil = object()\n    return shutil.which("uv")',
+            set(),
+        ),
+        (
+            'import shutil\nshutil.which("bwrap")\nshutil.which(value)\nshutil.which(*args)\nshutil.which()',
+            {(MODULE_MARKER, "bare_which")},
+        ),
+    ],
+)
+def test_resolution_matcher_models_bindings_and_conservative_arguments(source, expected):
+    """The guard follows lexical bindings and remains conservative for unknown args."""
+    visitor = _ResolutionSiteVisitor(ast.parse(source))
+    assert visitor.sites == expected
 
 
 @pytest.mark.parametrize(

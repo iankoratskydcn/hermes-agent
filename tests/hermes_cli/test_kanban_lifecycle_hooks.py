@@ -14,7 +14,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
-from hermes_cli.plugins import VALID_HOOKS, get_plugin_manager
+from hermes_cli.plugins import get_plugin_manager
 
 
 @pytest.fixture
@@ -47,8 +47,6 @@ def captured_hooks(monkeypatch):
         mgr._hooks = saved
 
 
-
-
 def test_claim_fires_hook(kanban_home, captured_hooks):
     conn = kbc.connect()
     try:
@@ -64,8 +62,6 @@ def test_claim_fires_hook(kanban_home, captured_hooks):
     assert kw["assignee"] == "worker"
     assert "profile_name" in kw
     assert kw["run_id"] is not None
-
-
 
 
 def test_misbehaving_hook_does_not_break_transition(kanban_home, monkeypatch):
@@ -89,3 +85,77 @@ def test_misbehaving_hook_does_not_break_transition(kanban_home, monkeypatch):
             conn.close()
     finally:
         mgr._hooks = saved
+
+
+def test_create_task_hook_flushes_after_caller_managed_commit(kanban_home, monkeypatch):
+    """A caller-owned BEGIN/COMMIT boundary still delivers after durability."""
+    conn = kbc.connect()
+    observed: list[bool] = []
+    monkeypatch.setattr(
+        kb,
+        "_fire_kanban_lifecycle_hook",
+        lambda event, *_args, **_kwargs: observed.append(conn.in_transaction),
+    )
+    try:
+        conn.execute("BEGIN")
+        task_id = kb.create_task(conn, title="external", assignee="worker")
+        assert task_id
+        assert observed == []
+        conn.commit()
+        assert observed == [False]
+    finally:
+        conn.close()
+
+
+def test_caller_managed_rollback_discards_create_hook(kanban_home, monkeypatch):
+    conn = kbc.connect()
+    observed: list[str] = []
+    monkeypatch.setattr(
+        kb,
+        "_fire_kanban_lifecycle_hook",
+        lambda event, *_args, **_kwargs: observed.append(event),
+    )
+    try:
+        conn.execute("BEGIN")
+        task_id = kb.create_task(conn, title="rolled back", assignee="worker")
+        conn.rollback()
+        assert kb.get_task(conn, task_id) is None
+        assert observed == []
+    finally:
+        conn.close()
+
+
+def test_nested_rollback_discards_only_inner_lifecycle_hooks(kanban_home, monkeypatch):
+    conn = kbc.connect()
+    observed: list[str] = []
+    monkeypatch.setattr(
+        kb,
+        "_fire_kanban_lifecycle_hook",
+        lambda event, *_args, **_kwargs: observed.append(event),
+    )
+    try:
+        with kbc.write_txn(conn):
+            root_id = kb.create_task(conn, title="root", assignee="worker")
+            with pytest.raises(RuntimeError, match="inner"):
+                with kbc.write_txn(conn, allow_nested=True):
+                    kb.create_task(conn, title="inner", assignee="worker")
+                    raise RuntimeError("inner")
+            assert kb.get_task(conn, root_id) is not None
+        assert observed == ["on_kanban_task_created"]
+        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE title = 'inner'").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_deferred_state_keeps_connection_identity(kanban_home):
+    conn = kbc.connect()
+    try:
+        kb._begin_deferred_lifecycle_frame(conn)
+        state = kb._deferred_lifecycle_state(conn)
+        assert state is not None
+        assert state.conn is conn
+        assert kb._has_deferred_lifecycle_state(conn)
+        kb._discard_deferred_lifecycle_hooks(conn)
+        assert not kb._has_deferred_lifecycle_state(conn)
+    finally:
+        conn.close()

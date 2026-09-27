@@ -20,11 +20,13 @@ def _stdout_queue(proc: subprocess.Popen) -> queue.Queue[dict]:
     return out
 
 
-def _read_json_line(out: queue.Queue[dict], timeout: float = 2.0) -> dict:
+def _read_json_line(out: queue.Queue[dict], timeout: float = 2.0, *, phase: str = "protocol") -> dict:
     try:
         return out.get(timeout=timeout)
     except queue.Empty as exc:
-        raise AssertionError("timed out waiting for compute host JSON") from exc
+        raise AssertionError(
+            f"timed out waiting for compute host JSON during {phase} ({timeout:.1f}s)"
+        ) from exc
 
 
 @pytest.mark.platforms("linux")
@@ -45,19 +47,21 @@ def test_compute_host_line_json_hello_and_shutdown():
     assert proc.stdin is not None
     out = _stdout_queue(proc)
     try:
-        hello = _read_json_line(out)
+        hello = _read_json_line(out, timeout=5.0, phase="startup hello")
         assert hello["type"] == "hello"
         assert hello["host_pid"] == proc.pid
 
         proc.stdin.write(json.dumps({"type": "bogus", "request_id": "b"}) + "\n")
         proc.stdin.flush()
-        error = _read_json_line(out)
+        error = _read_json_line(out, phase="unknown-frame response")
         assert error["type"] == "error"
         assert error["message"] == "unknown frame type: bogus"
 
         proc.stdin.write(json.dumps({"type": "shutdown", "request_id": "stop"}) + "\n")
         proc.stdin.flush()
-        assert _read_json_line(out)["type"] == "shutdown.ack"
+        shutdown = _read_json_line(out, phase="shutdown acknowledgement")
+        assert shutdown["type"] == "shutdown.ack"
+        assert shutdown["request_id"] == "stop"
         proc.wait(timeout=2)
     finally:
         if proc.poll() is None:

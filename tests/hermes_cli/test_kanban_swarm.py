@@ -124,7 +124,13 @@ def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
             verifier_assignee="reviewer",
             synthesizer_assignee="writer",
         )
-        assert hooks == [("kanban_task_completed", False)]
+        assert hooks == [
+            ("on_kanban_task_created", False),
+            ("on_kanban_task_created", False),
+            ("on_kanban_task_created", False),
+            ("on_kanban_task_created", False),
+            ("kanban_task_completed", False),
+        ]
     finally:
         reader.close()
         writer.close()

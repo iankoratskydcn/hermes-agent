@@ -248,15 +248,24 @@ def test_complete_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> No
 
 
 def test_complete_task_preserves_dirty_worktree(kanban_home: Path, repo: Path) -> None:
+    """Dirty handoffs are refused before teardown and remain auditable."""
     with kbc.connect_closing() as conn:
         tid, wt = _worktree_task(conn, repo)
         (wt / "wip.txt").write_text("unsaved\n", encoding="utf-8")
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
         assert kb.claim_task(conn, tid, claimer="worker") is not None
-        assert kb.complete_task(conn, tid, summary="done")
+        assert kb.complete_task(conn, tid, summary="done") is False
+        assert kb.get_task(conn, tid).status == "running"
+        event = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert event["kind"] == "completion_blocked_worktree"
+        assert "wip.txt" in event["payload"]
     assert wt.is_dir()
     assert (wt / "wip.txt").exists()
+    assert _branch_exists(repo, f"wt/{tid}")
 
 
 def test_archive_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> None:

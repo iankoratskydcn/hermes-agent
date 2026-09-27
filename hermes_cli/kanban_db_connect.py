@@ -46,6 +46,22 @@ _INIT_LOCK_TIMEOUT_SECONDS = 10.0
 _INIT_LOCK_POLL_SECONDS = 0.05
 
 
+class _KanbanConnection(sqlite3.Connection):
+    """Connection that closes the lifecycle-hook gap for caller-managed commits."""
+
+    def commit(self) -> None:
+        super().commit()
+        _kb._flush_deferred_lifecycle_hooks(self)
+
+    def rollback(self) -> None:
+        super().rollback()
+        _kb._discard_deferred_lifecycle_hooks(self)
+
+    def close(self) -> None:
+        _kb._discard_deferred_lifecycle_hooks(self)
+        super().close()
+
+
 def _resolve_busy_timeout_ms() -> int:
     """Return the SQLite busy timeout for Kanban connections. Kanban is the
     shared cross-profile dispatch bus, so worker stampedes are expected; a
@@ -64,6 +80,7 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     conn = connect_tracked(
         path,
         connect_fn=sqlite3.connect,
+        factory=_KanbanConnection,
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
     )
@@ -1259,6 +1276,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
                 "the outer transaction commits)."
             )
         savepoint = f"hermes_nested_{secrets.token_hex(8)}"
+        _kb._begin_deferred_lifecycle_frame(conn)
         conn.execute(f"SAVEPOINT {savepoint}")
         try:
             yield conn
@@ -1266,12 +1284,15 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute(f"ROLLBACK TO {savepoint}")
                 conn.execute(f"RELEASE {savepoint}")
+            _kb._discard_deferred_lifecycle_frame(conn)
             raise
         else:
             conn.execute(f"RELEASE {savepoint}")
+            _kb._merge_deferred_lifecycle_frame(conn)
         return
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    _kb._begin_deferred_lifecycle_frame(conn)
     try:
         yield conn
     except Exception:
@@ -1279,6 +1300,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         # don't let this secondary failure shadow the real one.
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute("ROLLBACK")
+        _kb._discard_deferred_lifecycle_hooks(conn)
         raise
     else:
         try:
@@ -1288,9 +1310,15 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             # connection isn't poisoned for the next BEGIN IMMEDIATE.
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute("ROLLBACK")
+            _kb._discard_deferred_lifecycle_hooks(conn)
             raise
         # Post-commit torn-extend check — raise now rather than silently corrupt.
-        _check_file_length_invariant(conn)
+        try:
+            _check_file_length_invariant(conn)
+        except Exception:
+            _kb._discard_deferred_lifecycle_hooks(conn)
+            raise
+        _kb._flush_deferred_lifecycle_hooks(conn)
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this

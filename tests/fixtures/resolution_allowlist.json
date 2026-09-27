@@ -355,11 +355,6 @@
     "kind": "bare_which"
   },
   {
-    "path": "hermes_cli/setup.py",
-    "symbol": "_check_espeak_ng",
-    "kind": "bare_which"
-  },
-  {
     "path": "hermes_cli/setup_terminal.py",
     "symbol": "_setup_backend_singularity",
     "kind": "bare_which"
