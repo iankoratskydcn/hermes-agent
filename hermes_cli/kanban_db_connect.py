@@ -630,6 +630,24 @@ def _schema_is_present(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
+def _validate_scholastic_receipts_schema(conn: sqlite3.Connection) -> None:
+    """Fail closed if an existing receipt table has drifted from the contract."""
+    expected = {
+        "board": 1, "project_id": 2, "task_id": 3, "run_id": 4,
+        "canonical_stage_id": 5, "attempt_id": 6, "receipt_schema_version": 0,
+        "receipt_json": 0, "receipt_hash": 0, "created_at": 0,
+    }
+    rows = conn.execute("PRAGMA table_info(scholastic_receipts)").fetchall()
+    if not rows:
+        raise RuntimeError("scholastic_receipts table is missing after schema initialization")
+    actual = {row["name"]: int(row["pk"]) for row in rows}
+    if actual != expected:
+        raise RuntimeError(
+            "scholastic_receipts schema drift detected; refusing to use existing table "
+            f"(expected {sorted(expected)}, got {sorted(actual)})"
+        )
+
+
 def _open_configured(path: Path, under_lock) -> tuple[sqlite3.Connection, Any]:
     """Open ``path`` with the kanban PRAGMA set, then run ``under_lock(conn)``.
     WAL activation and ``under_lock`` share the ``_INIT_LOCK`` critical section:
@@ -695,6 +713,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
     if resolved in _INITIALIZED_PATHS:
         conn, schema_present = _open_configured(path, _schema_is_present)
         if schema_present:
+            _validate_scholastic_receipts_schema(conn)
             return conn
         # Cache says "initialized", file says otherwise: it was deleted or
         # replaced under a live process and the open silently recreated an empty
@@ -727,8 +746,14 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             # Idempotent; runs under _INIT_LOCK so same-process dispatcher
             # threads can't race the ALTER TABLE pass with stale PRAGMA snapshots.
             if resolved not in _INITIALIZED_PATHS:
+                existing_receipts = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scholastic_receipts' LIMIT 1"
+                ).fetchone()
+                if existing_receipts is not None:
+                    _validate_scholastic_receipts_schema(conn)
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
+                _validate_scholastic_receipts_schema(conn)
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)

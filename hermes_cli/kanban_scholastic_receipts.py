@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -27,6 +28,9 @@ _STATUS_REASONS = {
     "timeout": {"timeout"},
 }
 _OPERATIONAL_BY_WIRE = {"ok": "SUCCEEDED", "escalate": "ESCALATED", "error": "ERROR", "timeout": "TIMEOUT"}
+_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_EXECUTION_PATHS = frozenset(("deterministic", "cpu", "gpu", "ollama"))
+_DOMAIN_STATUSES = frozenset(("ACCEPTED", "QUARANTINED", "REJECTED", "ABSTAINED"))
 
 
 class ReceiptError(ValueError):
@@ -94,13 +98,41 @@ def validate_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]:
     payload = dict(_reject_nonfinite(data["receipt"]))
     if set(payload) != _REQUIRED_PAYLOAD_KEYS:
         raise ReceiptError("receipt payload fields are incomplete or unknown")
-    if payload["status"] not in _STATUS_REASONS or payload["reason_code"] not in _STATUS_REASONS[payload["status"]]:
+    identity = payload["identity"]
+    if (not isinstance(identity, Mapping) or not {"run_id", "stage_id", "attempt_id"}.issubset(identity)
+            or not set(identity).issubset({"run_id", "stage_id", "attempt_id", "canonical_stage_id", "phase_id"})
+            or not isinstance(identity["run_id"], str) or not identity["run_id"].strip()
+            or type(identity["stage_id"]) is not int or identity["stage_id"] < 0
+            or not isinstance(identity["attempt_id"], str) or not identity["attempt_id"].strip()):
+        raise ReceiptError("identity is malformed")
+    for name in ("input_hash", "output_hash", "context_hash"):
+        value = payload[name]
+        if not isinstance(value, Mapping) or set(value) != {"sha256"} or not isinstance(value["sha256"], str) or not _HASH_RE.fullmatch(value["sha256"]):
+            raise ReceiptError(f"{name} is malformed")
+    status = payload["status"]
+    reason = payload["reason_code"]
+    if not isinstance(status, str) or not isinstance(reason, str) or status not in _STATUS_REASONS or reason not in _STATUS_REASONS[status]:
         raise ReceiptError("status and reason_code contradict")
-    if payload["wire_status"] != payload["status"] or payload["operational_status"] != _OPERATIONAL_BY_WIRE[payload["status"]]:
+    if payload["wire_status"] != status or payload["operational_status"] != _OPERATIONAL_BY_WIRE[status]:
         raise ReceiptError("status layers are malformed")
+    if payload["domain_status"] not in _DOMAIN_STATUSES or type(payload["domain_validated"]) is not bool:
+        raise ReceiptError("domain status is malformed")
+    confidence = payload["confidence"]
+    if confidence is not None and (type(confidence) not in (int, float) or not math.isfinite(float(confidence)) or not 0 <= confidence <= 1):
+        raise ReceiptError("confidence is malformed")
+    latency = payload["latency_ms"]
+    if type(latency) not in (int, float) or not math.isfinite(float(latency)) or latency < 0:
+        raise ReceiptError("latency_ms is malformed")
+    if not all(isinstance(payload[name], str) and payload[name].strip() for name in ("started_at", "completed_at")):
+        raise ReceiptError("timestamps are malformed")
     provenance = payload["provenance"]
     if not isinstance(provenance, Mapping) or set(provenance) != {"execution_path", "model_id", "model_digest", "model_version", "quantization", "server_version"}:
         raise ReceiptError("provenance is malformed")
+    if provenance["execution_path"] not in _EXECUTION_PATHS or any(
+        value is not None and (not isinstance(value, str) or not value.strip())
+        for key, value in provenance.items() if key != "execution_path"
+    ):
+        raise ReceiptError("provenance values are malformed")
     expected = receipt_hash(payload)
     if data["receipt_hash"] != expected:
         raise ReceiptError("receipt_hash does not match canonical receipt payload")
@@ -117,10 +149,21 @@ def _verify_owner(conn: sqlite3.Connection, *, project_id: str | None, task_id: 
         raise ReceiptError("task does not exist")
     if row["project_id"] != project_id:
         raise ReceiptError("receipt project scope does not match task")
-    # Existing Kanban runs are integer IDs. UUID run IDs remain valid for a
-    # sidecar-only caller, but numeric IDs must fence to the active task run.
-    if run_id.isdigit() and str(row["current_run_id"] or "") != run_id:
+    if run_id.isdigit():
+        if str(row["current_run_id"] or "") != run_id:
+            raise ReceiptError("receipt run is not the task's current run")
+        return
+    if row["current_run_id"] is None:
         raise ReceiptError("receipt run is not the task's current run")
+    run_row = conn.execute("SELECT status, metadata FROM task_runs WHERE id = ?", (row["current_run_id"],)).fetchone()
+    if run_row is None or run_row["status"] != "running":
+        raise ReceiptError("receipt run is not an active task run")
+    try:
+        metadata = json.loads(run_row["metadata"] or "{}")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ReceiptError("task run metadata is malformed") from exc
+    if not isinstance(metadata, dict) or metadata.get("scholastic_run_id") != run_id:
+        raise ReceiptError("receipt run is not the task's current Scholastic run")
 
 
 def put_scholastic_receipt(conn: sqlite3.Connection, *, board: str, project_id: str | None,

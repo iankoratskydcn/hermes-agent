@@ -86,3 +86,50 @@ def test_invalid_hash_scalar_and_scope_rejected(tmp_path):
         put_scholastic_receipt(conn, receipt=[], **kwargs)
     with pytest.raises(ReceiptError):
         put_scholastic_receipt(conn, receipt=_receipt(), **{**kwargs, "project_id": "other"})
+
+
+def test_uuid_run_requires_active_task_run_binding(tmp_path):
+    conn = _conn(tmp_path)
+    run_id = "uuid-run-1"
+    _seed_task(conn, run_id="7")
+    conn.execute(
+        "UPDATE tasks SET current_run_id = 7 WHERE id = 'task-1'"
+    )
+    conn.execute(
+        "INSERT INTO task_runs (id, task_id, status, started_at, metadata) VALUES (?, ?, ?, ?, ?)",
+        (7, "task-1", "running", 1, json.dumps({"scholastic_run_id": run_id})),
+    )
+    payload = _receipt()
+    payload["receipt"] = {**payload["receipt"], "identity": {**payload["receipt"]["identity"], "run_id": run_id}}
+    payload["receipt_hash"] = receipt_hash(payload["receipt"])
+    kwargs = dict(board="default", project_id="project-1", task_id="task-1", run_id=run_id, canonical_stage_id="1", attempt_id="attempt-1")
+    assert put_scholastic_receipt(conn, receipt=payload, **kwargs).state == "created"
+    with pytest.raises(ReceiptError):
+        put_scholastic_receipt(conn, receipt=payload, **{**kwargs, "run_id": "other-run"})
+
+
+def test_existing_receipt_schema_drift_fails_closed(tmp_path):
+    path = tmp_path / "drifted.db"
+    raw = sqlite3.connect(path)
+    raw.executescript("""
+        CREATE TABLE tasks (id TEXT PRIMARY KEY);
+        CREATE TABLE scholastic_receipts (board TEXT, receipt_json TEXT);
+    """)
+    raw.close()
+    with pytest.raises(RuntimeError, match="schema drift"):
+        kbc.connect(path)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("input_hash", {"sha256": "not-a-hash"}),
+    ("provenance", {"execution_path": "deterministic", "model_id": {"secret": "x"}, "model_digest": None, "model_version": None, "quantization": None, "server_version": None}),
+])
+def test_typed_payload_fields_fail_closed(tmp_path, field, value):
+    conn = _conn(tmp_path)
+    _seed_task(conn)
+    payload = _receipt()
+    payload["receipt"] = {**payload["receipt"], field: value}
+    payload["receipt_hash"] = receipt_hash(payload["receipt"])
+    kwargs = dict(board="default", project_id="project-1", task_id="task-1", run_id="7", canonical_stage_id="1", attempt_id="attempt-1")
+    with pytest.raises(ReceiptError):
+        put_scholastic_receipt(conn, receipt=payload, **kwargs)
