@@ -1238,6 +1238,26 @@ CREATE TABLE IF NOT EXISTS task_runs (
     sandbox_policy_hash TEXT
 );
 
+-- Durable authority for Scholastic stage receipts. Receipt identity is scoped
+-- to the board/project/task/run tuple; comments, events, metadata, and files
+-- are intentionally not receipt authority.
+CREATE TABLE IF NOT EXISTS scholastic_receipts (
+    board                  TEXT NOT NULL,
+    project_id             TEXT,
+    task_id                TEXT NOT NULL,
+    run_id                 TEXT NOT NULL,
+    canonical_stage_id     TEXT NOT NULL,
+    attempt_id             TEXT NOT NULL,
+    receipt_schema_version  TEXT NOT NULL,
+    receipt_json            TEXT NOT NULL,
+    receipt_hash            TEXT NOT NULL,
+    created_at              TEXT NOT NULL,
+    PRIMARY KEY (board, project_id, task_id, run_id, canonical_stage_id, attempt_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scholastic_receipts_task
+    ON scholastic_receipts(task_id, created_at);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
