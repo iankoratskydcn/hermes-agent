@@ -105,6 +105,8 @@ def validate_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]:
             or type(identity["stage_id"]) is not int or identity["stage_id"] < 0
             or not isinstance(identity["attempt_id"], str) or not identity["attempt_id"].strip()):
         raise ReceiptError("identity is malformed")
+    if "canonical_stage_id" in identity and str(identity["canonical_stage_id"]) != str(identity["stage_id"]):
+        raise ReceiptError("identity stage aliases contradict")
     for name in ("input_hash", "output_hash", "context_hash"):
         value = payload[name]
         if not isinstance(value, Mapping) or set(value) != {"sha256"} or not isinstance(value["sha256"], str) or not _HASH_RE.fullmatch(value["sha256"]):

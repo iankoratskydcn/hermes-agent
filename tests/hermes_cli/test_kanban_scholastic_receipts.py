@@ -146,6 +146,17 @@ def test_payload_identity_must_match_storage_scope(tmp_path):
         put_scholastic_receipt(conn, receipt=payload, **kwargs)
 
 
+def test_payload_stage_aliases_must_agree(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_task(conn)
+    payload = _receipt()
+    payload["receipt"] = {**payload["receipt"], "identity": {**payload["receipt"]["identity"], "canonical_stage_id": "2"}}
+    payload["receipt_hash"] = receipt_hash(payload["receipt"])
+    kwargs = dict(board="default", project_id="project-1", task_id="task-1", run_id="7", canonical_stage_id="2", attempt_id="attempt-1")
+    with pytest.raises(ReceiptError, match="aliases contradict"):
+        put_scholastic_receipt(conn, receipt=payload, **kwargs)
+
+
 def test_receipt_schema_type_drift_fails_closed(tmp_path):
     path = tmp_path / "typed-drift.db"
     raw = sqlite3.connect(path)
